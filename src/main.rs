@@ -260,6 +260,10 @@ async fn application_trampoline(config: Config) -> Result<()> {
         Some("days"),
     )
     .await?;
+
+    register_topic(&mut client, hostname, "sensor", None, "cpu", Some("%")).await?;
+    register_topic(&mut client, hostname, "sensor", None, "memory", Some("%")).await?;
+    register_topic(&mut client, hostname, "sensor", None, "swap", Some("%")).await?;
     register_topic(
         &mut client,
         hostname,
@@ -269,10 +273,6 @@ async fn application_trampoline(config: Config) -> Result<()> {
         Some("%"),
     )
     .await?;
-    register_topic(&mut client, hostname, "sensor", None, "cpu", Some("%")).await?;
-    register_topic(&mut client, hostname, "sensor", None, "memory", Some("%")).await?;
-    register_topic(&mut client, hostname, "sensor", None, "swap", Some("%")).await?;
-
     for drive in &config.drives {
         register_topic(
             &mut client,
@@ -328,10 +328,16 @@ async fn application_trampoline(config: Config) -> Result<()> {
 
                 // Report filesystem usage.
                 for drive in &config.drives {
-                    let disk = disk::usage(&drive.path).await?;
-                    let drive_percentile = (disk.total().get::<heim::units::information::byte>() - disk.free().get::<heim::units::information::byte>()) as f64 / disk.total().get::<heim::units::information::byte>() as f64;
+                    match disk::usage(&drive.path).await {
+                        Ok(disk) => {
+                            let drive_percentile = (disk.total().get::<heim::units::information::byte>() - disk.free().get::<heim::units::information::byte>()) as f64 / disk.total().get::<heim::units::information::byte>() as f64;
 
-                    publish(&mut client, &hostname, &drive.name, drive_percentile.clamp(0.0, 1.0).to_string()).await?;
+                            publish(&mut client, &hostname, &drive.name, drive_percentile.clamp(0.0, 1.0).to_string()).await?;
+                        },
+                        Err(error) => {
+                            log::warn!("Unable to read drive usage statistics: {}", error);
+                        }
+                    }
                 }
             }
             _ = signal::ctrl_c() => {
