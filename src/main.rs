@@ -132,7 +132,7 @@ async fn main() {
                         .start()
                         .expect("Failed to enter daemon mode.");
                 } else {
-                    mowl::init_with_level(log::LevelFilter::Debug).expect("Failed to setup log.");
+                    mowl::init_with_level(log::LevelFilter::Info).expect("Failed to setup log.");
                 }
                 if let Err(error) = application_trampoline(config).await {
                     log::error!("Fatal error: {}", error);
@@ -238,6 +238,19 @@ async fn application_trampoline(config: Config) -> Result<()> {
         Ok(())
     }
 
+    async fn publish(
+        client: &mut Client,
+        hostname: &str,
+        topic_name: &str,
+        value: String,
+    ) -> Result<()> {
+        let mut publish = Publish::new(format!("/{}/{}", hostname, topic_name), value.into());
+        publish.set_retain(false);
+        client.publish(&publish).await?;
+
+        Ok(())
+    }
+
     register_topic(
         &mut client,
         hostname,
@@ -287,13 +300,7 @@ async fn application_trampoline(config: Config) -> Result<()> {
             _ = time::sleep(config.update_interval) => {
                 // Report uptime.
                 let uptime = host::uptime().await?;
-                let topic_name = "uptime";
-                let mut publish = Publish::new(
-                    format!("/{}/{}", hostname, topic_name),
-                    uptime.get::<heim::units::time::day>().to_string().into(),
-                );
-                publish.set_retain(false);
-                client.publish(&publish).await?;
+                publish(&mut client, &hostname, "uptime", uptime.get::<heim::units::time::day>().to_string()).await?;
 
                 // Report CPU usage.
                 let cpu_stats = cpu::time().await?;
@@ -307,60 +314,24 @@ async fn application_trampoline(config: Config) -> Result<()> {
                 previous_total_cpu_time = total_cpu_time;
 
                 let cpu_load_percentile = used_cpu_time_delta / total_cpu_time_delta;
-
-                let topic_name = "cpu";
-                let mut publish = Publish::new(
-                    format!("/{}/{}", hostname, topic_name),
-                    // Due to floating point error this can produce a value just a smidge above 1.0.
-                    // Home assistant can handle that but it looks funny on the graphs so we clamp it.
-                    cpu_load_percentile.get::<heim::units::ratio::ratio>().clamp(0.0, 1.0).to_string().into(),
-                );
-                publish.set_retain(false);
-                client.publish(&publish).await?;
+                publish(&mut client, &hostname, "cpu", cpu_load_percentile.get::<heim::units::ratio::ratio>().clamp(0.0, 1.0).to_string()).await?;
 
                 // Report memory usage.
                 let memory = memory::memory().await?;
                 let memory_percentile = (memory.total().get::<heim::units::information::byte>() - memory.available().get::<heim::units::information::byte>()) as f64 / memory.total().get::<heim::units::information::byte>() as f64;
-
-                let topic_name = "memory";
-                let mut publish = Publish::new(
-                    format!("/{}/{}", hostname, topic_name),
-                    // Due to floating point error this can produce a value just a smidge above 1.0.
-                    // Home assistant can handle that but it looks funny on the graphs so we clamp it.
-                    memory_percentile.clamp(0.0, 1.0).to_string().into(),
-                );
-                publish.set_retain(false);
-                client.publish(&publish).await?;
+                publish(&mut client, &hostname, "memory", memory_percentile.clamp(0.0, 1.0).to_string()).await?;
 
                 // Report swap usage.
                 let swap = memory::swap().await?;
                 let swap_percentile = swap.used().get::<heim::units::information::byte>() as f64 / swap.total().get::<heim::units::information::byte>() as f64;
-
-                let topic_name = "swap";
-                let mut publish = Publish::new(
-                    format!("/{}/{}", hostname, topic_name),
-                    // Due to floating point error this can produce a value just a smidge above 1.0.
-                    // Home assistant can handle that but it looks funny on the graphs so we clamp it.
-                    swap_percentile.clamp(0.0, 1.0).to_string().into(),
-                );
-                publish.set_retain(false);
-                client.publish(&publish).await?;
+                publish(&mut client, &hostname, "swap", swap_percentile.clamp(0.0, 1.0).to_string()).await?;
 
                 // Report filesystem usage.
                 for drive in &config.drives {
-                    // log::info!("Drive usage of {}: {:?}", drive.name, disk::usage(&drive.path).await?);
-
                     let disk = disk::usage(&drive.path).await?;
                     let drive_percentile = (disk.total().get::<heim::units::information::byte>() - disk.free().get::<heim::units::information::byte>()) as f64 / disk.total().get::<heim::units::information::byte>() as f64;
 
-                    let mut publish = Publish::new(
-                        format!("/{}/{}", hostname, drive.name),
-                        // Due to floating point error this can produce a value just a smidge above 1.0.
-                        // Home assistant can handle that but it looks funny on the graphs so we clamp it.
-                        drive_percentile.clamp(0.0, 1.0).to_string().into(),
-                    );
-                    publish.set_retain(false);
-                    client.publish(&publish).await?;
+                    publish(&mut client, &hostname, &drive.name, drive_percentile.clamp(0.0, 1.0).to_string()).await?;
                 }
             }
             _ = signal::ctrl_c() => {

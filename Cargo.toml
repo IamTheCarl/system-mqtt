@@ -16,7 +16,6 @@ heim = { version = "0.1.0-rc.1", features = [
     "net",
     "host",
 ] }
-humantime = "2"
 keyring = "0.10"
 log = "0.4"
 mowl = "2"
