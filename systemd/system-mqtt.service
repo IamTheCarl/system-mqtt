@@ -1,0 +1,12 @@
+[Unit]
+Description=Broadcasts system statistics to an mqtt server of your choice.
+After=network-online.target
+
+[Service]
+User=root
+ExecStart=/usr/bin/system-mqtt run
+ExecReload=/bin/kill -HUP $MAINPID
+Restart=on-failure
+
+[Install]
+WantedBy=multi-user.target

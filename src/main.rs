@@ -6,7 +6,6 @@ use std::{
     path::{Path, PathBuf},
     time::Duration,
 };
-use syslog::{Facility, Formatter3164};
 use thiserror::Error;
 use tokio::{fs, signal, time};
 use url::Url;
@@ -34,15 +33,7 @@ enum SubCommand {
 #[derive(FromArgs, PartialEq, Debug)]
 /// Run the daemon.
 #[argh(subcommand, name = "run")]
-struct RunArguments {
-    /// run as a daemon process
-    #[argh(switch, short = 'f')]
-    foreground: bool,
-
-    /// log to stderr
-    #[argh(switch, short = 'e')]
-    stderr: bool,
-}
+struct RunArguments {}
 
 #[derive(FromArgs, PartialEq, Debug)]
 /// Set the password used to log into the mqtt client.
@@ -76,7 +67,7 @@ impl Default for Config {
         Self {
             mqtt_server: Url::parse("mqtt://localhost").expect("Failed to parse default URL."),
             username: None,
-            update_interval: Duration::from_secs(10),
+            update_interval: Duration::from_secs(30),
             drives: vec![DriveConfig {
                 path: PathBuf::from("/"),
                 name: String::from("root"),
@@ -122,21 +113,9 @@ async fn main() {
 
     match load_config(&arguments.config_file).await {
         Ok(config) => match arguments.command {
-            SubCommand::Run(arguments) => {
-                if !arguments.foreground {
-                    let formatter = Formatter3164 {
-                        facility: Facility::LOG_USER,
-                        hostname: None,
-                        process: env!("CARGO_CRATE_NAME").into(),
-                        pid: 0,
-                    };
-                    syslog::unix(formatter).expect("Failed to setup syslog.");
-                    daemonize_me::Daemon::new()
-                        .start()
-                        .expect("Failed to enter daemon mode.");
-                } else {
-                    mowl::init_with_level(log::LevelFilter::Info).expect("Failed to setup log.");
-                }
+            SubCommand::Run(_arguments) => {
+                mowl::init_with_level(log::LevelFilter::Info).expect("Failed to setup log.");
+
                 if let Err(error) = application_trampoline(config).await {
                     log::error!("Fatal error: {}", error);
                 }
