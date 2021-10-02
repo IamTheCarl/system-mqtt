@@ -31,15 +31,19 @@ If for some reason your feature just can't be fit within those requirement, make
 
 I brewed this up in less than a day and have less than an hour of runtime with it, so I don't feel ready to publish proper releases or a fancy pre-packaged installer. This means you'll be installing it from source.
 
-Step 1: Clone this repository.
+Step 1: [Setup MQTT with Home Assistant](https://www.home-assistant.io/integrations/mqtt/).
 
-Step 2: Make sure you have [cargo](https://doc.rust-lang.org/cargo/getting-started/installation.html) installed.
+Step 2: Clone this repository.
 
-Step 3: Install [cargo deb](https://crates.io/crates/cargo-deb).
+Step 3: Make sure you have [cargo](https://doc.rust-lang.org/cargo/getting-started/installation.html) installed.
 
-Step 4: Run the command `cargo deb --install`.
+Step 4: Install [cargo deb](https://crates.io/crates/cargo-deb).
 
-At this point you've installed system-mqtt as a debian package that can easily be removed. Next you need to configure system-mqtt.
+Step 5: Run the command `cargo deb --install`.
+
+At this point you've installed system-mqtt as a debian package that can easily be removed.
+
+At this point the daemon is installed, but won't run if the mqtt broker is not running on the local system. You'll need to edit the configuration to let it know about the mqtt broker and its credentials.
 
 # Configuration
 
@@ -71,3 +75,6 @@ drives:
   - path: /
     name: root
 ```
+
+Once you have adjusted the configuration as needed, run `systemctl reload system-mqtt` to restart the service with the new configuration.
+Run `systemctl status system-mqtt` after to verify the configuration loaded and the daemon is running correctly.
