@@ -5,7 +5,7 @@ version = "0.1.0"
 edition = "2018"
 license = "MIT"
 description = "Broadcasts system statistics to an mqtt server of your choice. Ideal for home assistant!"
-repository = ""
+repository = "https://github.com/IamTheCarl/system-mqtt"
 
 [dependencies]
 argh = "0.1"
