@@ -1,7 +1,7 @@
 [package]
 name = "system-mqtt"
 authors = ["James Carl"]
-version = "0.1.0"
+version = "0.2.0"
 edition = "2018"
 license = "MIT"
 description = "Broadcasts system statistics to an mqtt server of your choice. Ideal for home assistant!"

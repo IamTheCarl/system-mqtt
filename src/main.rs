@@ -116,8 +116,13 @@ async fn main() {
             SubCommand::Run(_arguments) => {
                 mowl::init_with_level(log::LevelFilter::Info).expect("Failed to setup log.");
 
-                if let Err(error) = application_trampoline(config).await {
-                    log::error!("Fatal error: {}", error);
+                loop {
+                    if let Err(error) = application_trampoline(&config).await {
+                        log::error!("Fatal error: {}", error);
+                    } else {
+                        // This is a graceful shutdown.
+                        break;
+                    }
                 }
             }
             SubCommand::SetPassword(_arguments) => {
@@ -163,18 +168,18 @@ async fn set_password(config: Config) -> Result<()> {
     }
 }
 
-async fn application_trampoline(config: Config) -> Result<()> {
+async fn application_trampoline(config: &Config) -> Result<()> {
     let mut client_builder = Client::builder();
     client_builder.set_url_string(config.mqtt_server.as_str())?;
 
     // If credentials are provided, use them.
-    if let Some(username) = config.username {
+    if let Some(username) = &config.username {
         // TODO make TLS mandatory when using this.
 
         let keyring = keyring::Keyring::new(KEYRING_SERVICE_NAME, &username);
         let password = keyring.get_password()?;
 
-        client_builder.set_username(Some(username));
+        client_builder.set_username(Some(username.into()));
         client_builder.set_password(Some(password.into()));
     }
 
