@@ -4,6 +4,7 @@ authors = ["James Carl"]
 version = "0.2.0"
 edition = "2018"
 license = "MIT"
+readme = "README.md"
 description = "Broadcasts system statistics to an mqtt server of your choice. Ideal for home assistant!"
 repository = "https://github.com/IamTheCarl/system-mqtt"
 

@@ -27,6 +27,13 @@ Want more statistics to be reported? I'm fine with that. Just make a pull reques
 
 If for some reason your feature just can't be fit within those requirement, make the pull request anyway and we'll talk about it. I'm sure we can find a compromise.
 
+# Dependencies
+
+* Building `system-mqtt` requires the Rust toolchain including the `cargo` package manager. Default repositories may be out of date and fail to build, so it is recommended to install Rust using the installer at [Rustup](https://rustup.rs/). Remove any existing instances of `rustc` on your system, and install a fresh copy of Rust using the instructions on Rustup.rs.
+* The Cargo helper command [cargo-deb](https://crates.io/crates/cargo-deb) is required to allow `cargo` to build a .deb package. Once Rust is installed, add `cargo-deb` with the command `cargo install cargo-deb`.
+* `libdbus-1-dev` is required, but not installed by default on many Debian systems. `sudo apt install libdbus-1-dev` will install from the Debian or Ubuntu repositories.
+* `libdbus-1-3` or similar is required, but is installed by default on most Debian and Ubuntu systems.
+
 # Installation
 
 I brewed this up in less than a day and have less than an hour of runtime with it, so I don't feel ready to publish proper releases or a fancy pre-packaged installer. This means you'll be installing it from source.
@@ -35,20 +42,19 @@ Step 1: [Setup MQTT with Home Assistant](https://www.home-assistant.io/integrati
 
 Step 2: Clone this repository.
 
-Step 3: Make sure you have [cargo](https://doc.rust-lang.org/cargo/getting-started/installation.html) installed.
+Step 3: Verify all dependencies are installed.
 
-Step 4: Install [cargo deb](https://crates.io/crates/cargo-deb).
+Step 4: Run the command `cargo deb --install` from the cloned directory.
 
-Step 5: Run the command `cargo deb --install`.
-
-At this point you've installed system-mqtt as a debian package that can easily be removed.
+At this point you've installed `system-mqtt` as a debian package that can easily be removed. It will automatically be registered with systemd, but may require a manual start with `systemctl start system-mqtt`.
 
 At this point the daemon is installed, but won't run if the mqtt broker is not running on the local system. You'll need to edit the configuration to let it know about the mqtt broker and its credentials.
 
 # Configuration
 
-The configuration file lives under `/etc/system-mqtt.yaml`.
-If it does not when you install system-mqtt, it will be created and populated with default arguments.
+The configuration file lives at `/etc/system-mqtt.yaml`.
+
+If it does not appear when you first install system-mqtt, it will be created and populated when `system-mqtt` is run with default arguments.
 
 Here is the default config with comments added explaining the configuration options:
 ```yaml
@@ -77,4 +83,5 @@ drives:
 ```
 
 Once you have adjusted the configuration as needed, run `systemctl reload system-mqtt` to restart the service with the new configuration.
+
 Run `systemctl status system-mqtt` after to verify the configuration loaded and the daemon is running correctly.
