@@ -212,13 +212,13 @@ async fn application_trampoline(config: &Config) -> Result<()> {
         let message = serde_json::ser::to_string(&TopicConfig {
             name: format!("{}-{}", hostname, topic_name),
             device_class: device_class.map(str::to_string),
-            state_topic: format!("/{}/{}", hostname, topic_name),
+            state_topic: format!("system-mqtt/{}/{}", hostname, topic_name),
             unit_of_measurement: unit_of_measurement.map(str::to_string),
         })?;
         let mut publish = Publish::new(
             format!(
-                "homeassistant/{}/{}/{}/config",
-                topic_class, topic_name, hostname
+                "homeassistant/{}/system-mqtt/{}/{}/config",
+                topic_class, hostname, topic_name
             ),
             message.into(),
         );
@@ -233,7 +233,7 @@ async fn application_trampoline(config: &Config) -> Result<()> {
         topic_name: &str,
         value: String,
     ) -> Result<()> {
-        let mut publish = Publish::new(format!("/{}/{}", hostname, topic_name), value.into());
+        let mut publish = Publish::new(format!("system-mqtt/{}/{}", hostname, topic_name), value.into());
         publish.set_retain(false);
         client.publish(&publish).await?;
 
@@ -279,7 +279,7 @@ async fn application_trampoline(config: &Config) -> Result<()> {
 
     client
         .publish(
-            &Publish::new(format!("{}/availability", hostname), "online".into()).set_retain(true),
+            &Publish::new(format!("system-mqtt/{}/availability", hostname), "online".into()).set_retain(true),
         )
         .await?;
 
@@ -366,7 +366,7 @@ async fn application_trampoline(config: &Config) -> Result<()> {
 
     client
         .publish(
-            &Publish::new(format!("{}/availability", hostname), "offline".into()).set_retain(true),
+            &Publish::new(format!("system-mqtt/{}/availability", hostname), "offline".into()).set_retain(true),
         )
         .await?;
 
