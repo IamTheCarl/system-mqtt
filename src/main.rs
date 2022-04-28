@@ -198,6 +198,7 @@ async fn application_trampoline(config: &Config) -> Result<()> {
         device_class: Option<&str>,
         topic_name: &str,
         unit_of_measurement: Option<&str>,
+        icon: Option<&str>,
     ) -> Result<()> {
         #[derive(Serialize)]
         struct TopicConfig {
@@ -207,6 +208,7 @@ async fn application_trampoline(config: &Config) -> Result<()> {
             device_class: Option<String>,
             state_topic: String,
             unit_of_measurement: Option<String>,
+            icon: Option<String>,
         }
 
         let message = serde_json::ser::to_string(&TopicConfig {
@@ -214,10 +216,11 @@ async fn application_trampoline(config: &Config) -> Result<()> {
             device_class: device_class.map(str::to_string),
             state_topic: format!("system-mqtt/{}/{}", hostname, topic_name),
             unit_of_measurement: unit_of_measurement.map(str::to_string),
+            icon: icon.map(str::to_string),
         })?;
         let mut publish = Publish::new(
             format!(
-                "homeassistant/{}/system-mqtt/{}/{}/config",
+                "homeassistant/{}/system-mqtt-{}/{}/config",
                 topic_class, hostname, topic_name
             ),
             message.into(),
@@ -233,13 +236,31 @@ async fn application_trampoline(config: &Config) -> Result<()> {
         topic_name: &str,
         value: String,
     ) -> Result<()> {
-        let mut publish = Publish::new(format!("system-mqtt/{}/{}", hostname, topic_name), value.into());
+        let mut publish = Publish::new(
+            format!("system-mqtt/{}/{}", hostname, topic_name),
+            value.into(),
+        );
         publish.set_retain(false);
         client.publish(&publish).await?;
 
         Ok(())
     }
 
+    // Register the various sensor topics and include the details about that sensor
+
+    //    TODO - create a new register_topic to register binary_sensor so we can make availability a real binary sensor. In the
+    //    meantime, create it as a normal analog sensor with two values, and a template can be used to make it a binary.
+
+    register_topic(
+        &mut client,
+        hostname,
+        "sensor",
+        None,
+        "available",
+        None,
+        Some("mdi:check-network-outline"),
+    )
+    .await?;
     register_topic(
         &mut client,
         hostname,
@@ -247,13 +268,61 @@ async fn application_trampoline(config: &Config) -> Result<()> {
         None,
         "uptime",
         Some("days"),
+        Some("mdi:timer-sand"),
+    )
+    .await?;
+    register_topic(
+        &mut client,
+        hostname,
+        "sensor",
+        None,
+        "cpu",
+        Some("%"),
+        Some("mdi:gauge"),
+    )
+    .await?;
+    register_topic(
+        &mut client,
+        hostname,
+        "sensor",
+        None,
+        "memory",
+        Some("%"),
+        Some("mdi:gauge"),
+    )
+    .await?;
+    register_topic(
+        &mut client,
+        hostname,
+        "sensor",
+        None,
+        "swap",
+        Some("%"),
+        Some("mdi:gauge"),
+    )
+    .await?;
+    register_topic(
+        &mut client,
+        hostname,
+        "sensor",
+        Some("battery"),
+        "battery_level",
+        Some("%"),
+        Some("mdi:battery"),
+    )
+    .await?;
+    register_topic(
+        &mut client,
+        hostname,
+        "sensor",
+        None,
+        "battery_state",
+        None,
+        Some("mdi:battery"),
     )
     .await?;
 
-    register_topic(&mut client, hostname, "sensor", None, "cpu", Some("%")).await?;
-    register_topic(&mut client, hostname, "sensor", None, "memory", Some("%")).await?;
-    register_topic(&mut client, hostname, "sensor", None, "swap", Some("%")).await?;
-
+    // Register the sensors for filesystems
     for drive in &config.drives {
         register_topic(
             &mut client,
@@ -262,24 +331,18 @@ async fn application_trampoline(config: &Config) -> Result<()> {
             None,
             &drive.name,
             Some("%"),
+            Some("mdi:folder"),
         )
         .await?;
     }
 
-    register_topic(
-        &mut client,
-        hostname,
-        "sensor",
-        Some("battery"),
-        "battery_level",
-        Some("%"),
-    )
-    .await?;
-    register_topic(&mut client, hostname, "sensor", None, "battery_state", None).await?;
-
     client
         .publish(
-            &Publish::new(format!("system-mqtt/{}/availability", hostname), "online".into()).set_retain(true),
+            &Publish::new(
+                format!("system-mqtt/{}/availability", hostname),
+                "online".into(),
+            )
+            .set_retain(true),
         )
         .await?;
 
@@ -366,7 +429,11 @@ async fn application_trampoline(config: &Config) -> Result<()> {
 
     client
         .publish(
-            &Publish::new(format!("system-mqtt/{}/availability", hostname), "offline".into()).set_retain(true),
+            &Publish::new(
+                format!("system-mqtt/{}/availability", hostname),
+                "offline".into(),
+            )
+            .set_retain(true),
         )
         .await?;
 
