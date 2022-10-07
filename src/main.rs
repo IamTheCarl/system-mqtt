@@ -257,7 +257,7 @@ async fn application_trampoline(config: &Config) -> Result<()> {
         "sensor",
         None,
         "available",
-        None,
+        Some(""),
         Some("mdi:check-network-outline"),
     )
     .await?;
@@ -317,7 +317,7 @@ async fn application_trampoline(config: &Config) -> Result<()> {
         "sensor",
         None,
         "battery_state",
-        None,
+        Some(""),
         Some("mdi:battery"),
     )
     .await?;
