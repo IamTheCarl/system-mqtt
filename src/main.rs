@@ -1,12 +1,13 @@
+use anyhow::{bail, Context, Result};
 use argh::FromArgs;
 use heim::{cpu, disk, host, memory};
 use mqtt_async_client::client::{Client, Publish};
 use serde::{Deserialize, Serialize};
 use std::{
+    os::unix::prelude::MetadataExt,
     path::{Path, PathBuf},
     time::Duration,
 };
-use thiserror::Error;
 use tokio::{fs, signal, time};
 use url::Url;
 
@@ -47,6 +48,18 @@ struct DriveConfig {
 }
 
 #[derive(Serialize, Deserialize)]
+enum PasswordSource {
+    Keyring,
+    SecretFile(PathBuf),
+}
+
+impl Default for PasswordSource {
+    fn default() -> Self {
+        Self::Keyring
+    }
+}
+
+#[derive(Serialize, Deserialize)]
 struct Config {
     /// The URL of the mqtt server.
     mqtt_server: Url,
@@ -54,6 +67,12 @@ struct Config {
     /// Set the username to connect to the mqtt server, if required.
     /// The password will be fetched from the OS keyring.
     username: Option<String>,
+
+    /// Where the password for the MQTT server can be found.
+    /// If a username is not specified, this field is ignored.
+    /// If not specified, this field defaults to the keyring.
+    #[serde(default)]
+    password_source: PasswordSource,
 
     /// The interval to update at.
     update_interval: Duration,
@@ -67,6 +86,7 @@ impl Default for Config {
         Self {
             mqtt_server: Url::parse("mqtt://localhost").expect("Failed to parse default URL."),
             username: None,
+            password_source: PasswordSource::Keyring,
             update_interval: Duration::from_secs(30),
             drives: vec![DriveConfig {
                 path: PathBuf::from("/"),
@@ -75,37 +95,6 @@ impl Default for Config {
         }
     }
 }
-
-#[derive(Error, Debug)]
-enum Error {
-    #[error("IO Error: {0}")]
-    Io(#[from] std::io::Error),
-
-    #[error("Yaml encoding error: {0}")]
-    YamlEncoding(#[from] serde_yaml::Error),
-
-    #[error("Json encoding error: {0}")]
-    JsonEncoding(#[from] serde_json::Error),
-
-    #[error("You must set the username for login with the mqtt server before you can set the user's password")]
-    CredentialsNotEnabled,
-
-    #[error(
-        "Keyring Error: {0}\nIf you have not yet set the password run `system-mqtt set-password`."
-    )]
-    Keyring(#[from] keyring::KeyringError),
-
-    #[error("Error with mqtt protocol: {0}")]
-    Mqtt(#[from] mqtt_async_client::Error),
-
-    #[error("Failed to fetch system info: {0}")]
-    SystemInfo(#[from] heim::Error),
-
-    #[error("Failed to read battery info: {0}")]
-    Battery(#[from] battery::Error),
-}
-
-type Result<T> = std::result::Result<T, Error>;
 
 #[tokio::main]
 async fn main() {
@@ -116,13 +105,8 @@ async fn main() {
             SubCommand::Run(_arguments) => {
                 mowl::init_with_level(log::LevelFilter::Info).expect("Failed to setup log.");
 
-                loop {
-                    if let Err(error) = application_trampoline(&config).await {
-                        log::error!("Fatal error: {}", error);
-                    } else {
-                        // This is a graceful shutdown.
-                        break;
-                    }
+                while let Err(error) = application_trampoline(&config).await {
+                    log::error!("Fatal error: {}", error);
                 }
             }
             SubCommand::SetPassword(_arguments) => {
@@ -157,14 +141,15 @@ async fn load_config(path: &Path) -> Result<Config> {
 
 async fn set_password(config: Config) -> Result<()> {
     if let Some(username) = config.username {
-        let password = rpassword::read_password_from_tty(Some("Password: "))?;
+        let password = rpassword::read_password_from_tty(Some("Password: "))
+            .context("Failed to read password from TTY.")?;
 
         let keyring = keyring::Keyring::new(KEYRING_SERVICE_NAME, &username);
-        keyring.set_password(&password)?;
+        keyring.set_password(&password).context("Keyring error.")?;
 
         Ok(())
     } else {
-        Err(Error::CredentialsNotEnabled)
+        bail!("You must set the username for login with the mqtt server before you can set the user's password")
     }
 }
 
@@ -176,8 +161,37 @@ async fn application_trampoline(config: &Config) -> Result<()> {
     if let Some(username) = &config.username {
         // TODO make TLS mandatory when using this.
 
-        let keyring = keyring::Keyring::new(KEYRING_SERVICE_NAME, &username);
-        let password = keyring.get_password()?;
+        let password = match &config.password_source {
+            PasswordSource::Keyring => {
+                let keyring = keyring::Keyring::new(KEYRING_SERVICE_NAME, username);
+                keyring
+                    .get_password()
+                    .context("Failed to get password from keyring. If you have not yet set the password, run `system-mqtt set-password`.")?
+            }
+            PasswordSource::SecretFile(file_path) => {
+                let metadata = file_path
+                    .metadata()
+                    .context("Failed to get password file metadata.")?;
+
+                // It's not even an encrypted file, so we need to keep the permission settings pretty tight.
+                // The only time I can really enforce that is when reading the password.
+                if metadata.mode() == 0o600 {
+                    if metadata.uid() == users::get_current_uid() {
+                        if metadata.gid() == users::get_current_gid() {
+                            fs::read_to_string(file_path)
+                                .await
+                                .context("Failed to read password file.")?
+                        } else {
+                            bail!("Password file must be owned by the current group.");
+                        }
+                    } else {
+                        bail!("Password file must be owned by the current user.");
+                    }
+                } else {
+                    bail!("Permission bits for password file must be set to 0o600 (only owner can read and write)");
+                }
+            }
+        };
 
         client_builder.set_username(Some(username.into()));
         client_builder.set_password(Some(password.into()));
@@ -338,7 +352,7 @@ async fn application_trampoline(config: &Config) -> Result<()> {
 
     client
         .publish(
-            &Publish::new(
+            Publish::new(
                 format!("system-mqtt/{}/availability", hostname),
                 "online".into(),
             )
@@ -355,7 +369,7 @@ async fn application_trampoline(config: &Config) -> Result<()> {
             _ = time::sleep(config.update_interval) => {
                 // Report uptime.
                 let uptime = host::uptime().await?;
-                publish(&mut client, &hostname, "uptime", uptime.get::<heim::units::time::day>().to_string()).await?;
+                publish(&mut client, hostname, "uptime", uptime.get::<heim::units::time::day>().to_string()).await?;
 
                 // Report CPU usage.
                 let cpu_stats = cpu::time().await?;
@@ -369,17 +383,17 @@ async fn application_trampoline(config: &Config) -> Result<()> {
                 previous_total_cpu_time = total_cpu_time;
 
                 let cpu_load_percentile = used_cpu_time_delta / total_cpu_time_delta;
-                publish(&mut client, &hostname, "cpu", (cpu_load_percentile.get::<heim::units::ratio::ratio>().clamp(0.0, 1.0) * 100.0).to_string()).await?;
+                publish(&mut client, hostname, "cpu", (cpu_load_percentile.get::<heim::units::ratio::ratio>().clamp(0.0, 1.0) * 100.0).to_string()).await?;
 
                 // Report memory usage.
                 let memory = memory::memory().await?;
                 let memory_percentile = (memory.total().get::<heim::units::information::byte>() - memory.available().get::<heim::units::information::byte>()) as f64 / memory.total().get::<heim::units::information::byte>() as f64;
-                publish(&mut client, &hostname, "memory", (memory_percentile.clamp(0.0, 1.0)* 100.0).to_string()).await?;
+                publish(&mut client, hostname, "memory", (memory_percentile.clamp(0.0, 1.0)* 100.0).to_string()).await?;
 
                 // Report swap usage.
                 let swap = memory::swap().await?;
                 let swap_percentile = swap.used().get::<heim::units::information::byte>() as f64 / swap.total().get::<heim::units::information::byte>() as f64;
-                publish(&mut client, &hostname, "swap", (swap_percentile.clamp(0.0, 1.0) * 100.0).to_string()).await?;
+                publish(&mut client, hostname, "swap", (swap_percentile.clamp(0.0, 1.0) * 100.0).to_string()).await?;
 
                 // Report filesystem usage.
                 for drive in &config.drives {
@@ -387,7 +401,7 @@ async fn application_trampoline(config: &Config) -> Result<()> {
                         Ok(disk) => {
                             let drive_percentile = (disk.total().get::<heim::units::information::byte>() - disk.free().get::<heim::units::information::byte>()) as f64 / disk.total().get::<heim::units::information::byte>() as f64;
 
-                            publish(&mut client, &hostname, &drive.name, (drive_percentile.clamp(0.0, 1.0) * 100.0).to_string()).await?;
+                            publish(&mut client, hostname, &drive.name, (drive_percentile.clamp(0.0, 1.0) * 100.0).to_string()).await?;
                         },
                         Err(error) => {
                             log::warn!("Unable to read drive usage statistics: {}", error);
@@ -395,29 +409,25 @@ async fn application_trampoline(config: &Config) -> Result<()> {
                     }
                 }
 
-                for maybe_battery in manager.batteries()? {
-                    if let Ok(battery) = maybe_battery {
-                        use battery::State;
+                // TODO we should probably combine the battery charges, but for now we're just going to use the first detected battery.
+                if let Some(battery) = manager.batteries().context("Failed to read battery info.")?.flatten().next() {
+                    use battery::State;
 
-                        let battery_state = match battery.state() {
-                            State::Charging => "charging",
-                            State::Discharging => "discharging",
-                            State::Empty => "empty",
-                            State::Full => "full",
-                            _ => "unknown",
-                        };
+                    let battery_state = match battery.state() {
+                        State::Charging => "charging",
+                        State::Discharging => "discharging",
+                        State::Empty => "empty",
+                        State::Full => "full",
+                        _ => "unknown",
+                    };
 
-                        publish(&mut client, &hostname, "battery_state", battery_state.to_string()).await?;
+                    publish(&mut client, hostname, "battery_state", battery_state.to_string()).await?;
 
-                        let battery_full = battery.energy_full();
-                        let battery_power = battery.energy();
-                        let battery_level = battery_power / battery_full;
+                    let battery_full = battery.energy_full();
+                    let battery_power = battery.energy();
+                    let battery_level = battery_power / battery_full;
 
-                        publish(&mut client, &hostname, "battery_level", format!("{:03}", battery_level.get::<heim::units::ratio::percent>())).await?;
-
-                        // TODO we should probably combine the battery charges, but for now we're just going to use the first detected battery.
-                        break;
-                    }
+                    publish(&mut client, hostname, "battery_level", format!("{:03}", battery_level.get::<heim::units::ratio::percent>())).await?;
                 }
             }
             _ = signal::ctrl_c() => {
@@ -429,7 +439,7 @@ async fn application_trampoline(config: &Config) -> Result<()> {
 
     client
         .publish(
-            &Publish::new(
+            Publish::new(
                 format!("system-mqtt/{}/availability", hostname),
                 "offline".into(),
             )
