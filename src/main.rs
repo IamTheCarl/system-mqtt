@@ -1,9 +1,10 @@
 use anyhow::{bail, Context, Result};
 use argh::FromArgs;
 use heim::{cpu, disk, host, memory};
-use mqtt_async_client::client::{Client, Publish};
+use mqtt_async_client::client::{Client as MqttClient, Publish};
 use serde::{Deserialize, Serialize};
 use std::{
+    collections::HashSet,
     os::unix::prelude::MetadataExt,
     path::{Path, PathBuf},
     time::Duration,
@@ -158,7 +159,7 @@ async fn set_password(config: Config) -> Result<()> {
 async fn application_trampoline(config: &Config) -> Result<()> {
     log::info!("Application start.");
 
-    let mut client_builder = Client::builder();
+    let mut client_builder = MqttClient::builder();
     client_builder.set_url_string(config.mqtt_server.as_str())?;
 
     // If credentials are provided, use them.
@@ -214,144 +215,91 @@ async fn application_trampoline(config: &Config) -> Result<()> {
     let platform = host::platform().await.context("Failed to setup HEIM.")?;
     let hostname = platform.hostname().to_string();
 
+    let mut home_assistant = HomeAssistant {
+        client,
+        hostname,
+        registered_topics: HashSet::new(),
+    };
+
     // Register the various sensor topics and include the details about that sensor
 
     //    TODO - create a new register_topic to register binary_sensor so we can make availability a real binary sensor. In the
     //    meantime, create it as a normal analog sensor with two values, and a template can be used to make it a binary.
 
-    register_topic(
-        &mut client,
-        &hostname,
-        "sensor",
-        None,
-        "available",
-        None,
-        Some("mdi:check-network-outline"),
-    )
-    .await
-    .context("Failed to register availability topic.")?;
-    register_topic(
-        &mut client,
-        &hostname,
-        "sensor",
-        None,
-        "uptime",
-        Some("days"),
-        Some("mdi:timer-sand"),
-    )
-    .await
-    .context("Failed to register uptime topic.")?;
-    register_topic(
-        &mut client,
-        &hostname,
-        "sensor",
-        None,
-        "cpu",
-        Some("%"),
-        Some("mdi:gauge"),
-    )
-    .await
-    .context("Failed to register CPU usage topic.")?;
-    register_topic(
-        &mut client,
-        &hostname,
-        "sensor",
-        None,
-        "memory",
-        Some("%"),
-        Some("mdi:gauge"),
-    )
-    .await
-    .context("Failed to register memory usage topic.")?;
-    register_topic(
-        &mut client,
-        &hostname,
-        "sensor",
-        None,
-        "swap",
-        Some("%"),
-        Some("mdi:gauge"),
-    )
-    .await
-    .context("Failed to register swap usage topic.")?;
-    register_topic(
-        &mut client,
-        &hostname,
-        "sensor",
-        Some("battery"),
-        "battery_level",
-        Some("%"),
-        Some("mdi:battery"),
-    )
-    .await
-    .context("Failed to register battery level topic.")?;
-    register_topic(
-        &mut client,
-        &hostname,
-        "sensor",
-        None,
-        "battery_state",
-        None,
-        Some("mdi:battery"),
-    )
-    .await
-    .context("Failed to register battery state topic.")?;
+    home_assistant
+        .register_topic(
+            "sensor",
+            None,
+            "available",
+            None,
+            Some("mdi:check-network-outline"),
+        )
+        .await
+        .context("Failed to register availability topic.")?;
+    home_assistant
+        .register_topic(
+            "sensor",
+            None,
+            "uptime",
+            Some("days"),
+            Some("mdi:timer-sand"),
+        )
+        .await
+        .context("Failed to register uptime topic.")?;
+    home_assistant
+        .register_topic("sensor", None, "cpu", Some("%"), Some("mdi:gauge"))
+        .await
+        .context("Failed to register CPU usage topic.")?;
+    home_assistant
+        .register_topic("sensor", None, "memory", Some("%"), Some("mdi:gauge"))
+        .await
+        .context("Failed to register memory usage topic.")?;
+    home_assistant
+        .register_topic("sensor", None, "swap", Some("%"), Some("mdi:gauge"))
+        .await
+        .context("Failed to register swap usage topic.")?;
+    home_assistant
+        .register_topic(
+            "sensor",
+            Some("battery"),
+            "battery_level",
+            Some("%"),
+            Some("mdi:battery"),
+        )
+        .await
+        .context("Failed to register battery level topic.")?;
+    home_assistant
+        .register_topic("sensor", None, "battery_state", None, Some("mdi:battery"))
+        .await
+        .context("Failed to register battery state topic.")?;
 
     // Register the sensors for filesystems
     for drive in &config.drives {
-        register_topic(
-            &mut client,
-            &hostname,
-            "sensor",
-            None,
-            &drive.name,
-            Some("%"),
-            Some("mdi:folder"),
-        )
-        .await
-        .context("Failed to register a filesystem topic.")?;
+        home_assistant
+            .register_topic("sensor", None, &drive.name, Some("%"), Some("mdi:folder"))
+            .await
+            .context("Failed to register a filesystem topic.")?;
     }
 
-    client
-        .publish(
-            Publish::new(
-                format!("system-mqtt/{}/availability", hostname),
-                "online".into(),
-            )
-            .set_retain(true),
-        )
-        .await
-        .context("Failed to publish availability topic.")?;
+    home_assistant.set_available(true).await?;
 
-    let result = availability_trampoline(&mut client, config, &hostname, manager).await;
+    let result = availability_trampoline(&home_assistant, config, manager).await;
 
-    if let Err(error) = client
-        .publish(
-            Publish::new(
-                format!("system-mqtt/{}/availability", hostname),
-                "offline".into(),
-            )
-            .set_retain(true),
-        )
-        .await
-    {
+    if let Err(error) = home_assistant.set_available(false).await {
         // I don't want this error hiding whatever happened in the main loop.
-        if result.is_ok() {
-            Err(error).context("Failed to publish change to offline state.")?
-        }
-    } else {
-        result?;
+        log::error!("Error while disconnecting from home assistant: {:?}", error);
     }
 
-    client.disconnect().await?;
+    result?;
+
+    home_assistant.disconnect().await?;
 
     Ok(())
 }
 
 async fn availability_trampoline(
-    client: &mut Client,
+    home_assistant: &HomeAssistant,
     config: &Config,
-    hostname: &str,
     manager: battery::Manager,
 ) -> Result<()> {
     let cpu_stats = cpu::time().await?;
@@ -364,7 +312,7 @@ async fn availability_trampoline(
             _ = time::sleep(config.update_interval) => {
                 // Report uptime.
                 let uptime = host::uptime().await.context("Failed to get uptime.")?;
-                publish(client, hostname, "uptime", uptime.get::<heim::units::time::day>().to_string()).await?;
+                home_assistant.publish("uptime", uptime.get::<heim::units::time::day>().to_string()).await;
 
                 // Report CPU usage.
                 let cpu_stats = cpu::time().await.context("Failed to get CPU usage.")?;
@@ -378,17 +326,17 @@ async fn availability_trampoline(
                 previous_total_cpu_time = total_cpu_time;
 
                 let cpu_load_percentile = used_cpu_time_delta / total_cpu_time_delta;
-                publish(client, hostname, "cpu", (cpu_load_percentile.get::<heim::units::ratio::ratio>().clamp(0.0, 1.0) * 100.0).to_string()).await?;
+                home_assistant.publish("cpu", (cpu_load_percentile.get::<heim::units::ratio::ratio>().clamp(0.0, 1.0) * 100.0).to_string()).await;
 
                 // Report memory usage.
                 let memory = memory::memory().await.context("Failed to get memory usage.")?;
                 let memory_percentile = (memory.total().get::<heim::units::information::byte>() - memory.available().get::<heim::units::information::byte>()) as f64 / memory.total().get::<heim::units::information::byte>() as f64;
-                publish(client, hostname, "memory", (memory_percentile.clamp(0.0, 1.0)* 100.0).to_string()).await?;
+                home_assistant.publish("memory", (memory_percentile.clamp(0.0, 1.0)* 100.0).to_string()).await;
 
                 // Report swap usage.
                 let swap = memory::swap().await.context("Failed to get swap usage.")?;
                 let swap_percentile = swap.used().get::<heim::units::information::byte>() as f64 / swap.total().get::<heim::units::information::byte>() as f64;
-                publish(client, hostname, "swap", (swap_percentile.clamp(0.0, 1.0) * 100.0).to_string()).await?;
+                home_assistant.publish("swap", (swap_percentile.clamp(0.0, 1.0) * 100.0).to_string()).await;
 
                 // Report filesystem usage.
                 for drive in &config.drives {
@@ -396,7 +344,7 @@ async fn availability_trampoline(
                         Ok(disk) => {
                             let drive_percentile = (disk.total().get::<heim::units::information::byte>() - disk.free().get::<heim::units::information::byte>()) as f64 / disk.total().get::<heim::units::information::byte>() as f64;
 
-                            publish(client, hostname, &drive.name, (drive_percentile.clamp(0.0, 1.0) * 100.0).to_string()).await?;
+                            home_assistant.publish(&drive.name, (drive_percentile.clamp(0.0, 1.0) * 100.0).to_string()).await;
                         },
                         Err(error) => {
                             log::warn!("Unable to read drive usage statistics: {}", error);
@@ -416,13 +364,13 @@ async fn availability_trampoline(
                         _ => "unknown",
                     };
 
-                    publish(client, hostname, "battery_state", battery_state.to_string()).await?;
+                    home_assistant.publish("battery_state", battery_state.to_string()).await;
 
                     let battery_full = battery.energy_full();
                     let battery_power = battery.energy();
                     let battery_level = battery_power / battery_full;
 
-                    publish(client, hostname, "battery_level", format!("{:03}", battery_level.get::<heim::units::ratio::percent>())).await?;
+                    home_assistant.publish("battery_level", format!("{:03}", battery_level.get::<heim::units::ratio::percent>())).await;
                 }
             }
             _ = signal::ctrl_c() => {
@@ -435,64 +383,94 @@ async fn availability_trampoline(
     Ok(())
 }
 
-async fn register_topic(
-    client: &mut Client,
-    hostname: &str,
-    topic_class: &str,
-    device_class: Option<&str>,
-    topic_name: &str,
-    unit_of_measurement: Option<&str>,
-    icon: Option<&str>,
-) -> Result<()> {
-    log::info!("Registering topic `{}`.", topic_name);
-
-    #[derive(Serialize)]
-    struct TopicConfig {
-        name: String,
-
-        #[serde(skip_serializing_if = "Option::is_none")]
-        device_class: Option<String>,
-        state_topic: String,
-        unit_of_measurement: Option<String>,
-        icon: Option<String>,
-    }
-
-    let message = serde_json::ser::to_string(&TopicConfig {
-        name: format!("{}-{}", hostname, topic_name),
-        device_class: device_class.map(str::to_string),
-        state_topic: format!("system-mqtt/{}/{}", hostname, topic_name),
-        unit_of_measurement: unit_of_measurement.map(str::to_string),
-        icon: icon.map(str::to_string),
-    })
-    .context("Failed to serialize topic information.")?;
-    let mut publish = Publish::new(
-        format!(
-            "homeassistant/{}/system-mqtt-{}/{}/config",
-            topic_class, hostname, topic_name
-        ),
-        message.into(),
-    );
-    publish.set_retain(true);
-    client
-        .publish(&publish)
-        .await
-        .context("Failed to publish topic to MQTT server.")?;
-
-    Ok(())
+pub struct HomeAssistant {
+    client: MqttClient,
+    hostname: String,
+    registered_topics: HashSet<String>,
 }
 
-async fn publish(
-    client: &mut Client,
-    hostname: &str,
-    topic_name: &str,
-    value: String,
-) -> Result<()> {
-    let mut publish = Publish::new(
-        format!("system-mqtt/{}/{}", hostname, topic_name),
-        value.into(),
-    );
-    publish.set_retain(false);
-    client.publish(&publish).await?;
+impl HomeAssistant {
+    pub async fn set_available(&self, available: bool) -> Result<()> {
+        self.client
+            .publish(
+                Publish::new(
+                    format!("system-mqtt/{}/availability", self.hostname),
+                    if available { "online" } else { "offline" }.into(),
+                )
+                .set_retain(true),
+            )
+            .await
+            .context("Failed to publish availability topic.")
+    }
 
-    Ok(())
+    pub async fn register_topic(
+        &mut self,
+        topic_class: &str,
+        device_class: Option<&str>,
+        topic_name: &str,
+        unit_of_measurement: Option<&str>,
+        icon: Option<&str>,
+    ) -> Result<()> {
+        log::info!("Registering topic `{}`.", topic_name);
+
+        #[derive(Serialize)]
+        struct TopicConfig {
+            name: String,
+
+            #[serde(skip_serializing_if = "Option::is_none")]
+            device_class: Option<String>,
+            state_topic: String,
+            unit_of_measurement: Option<String>,
+            icon: Option<String>,
+        }
+
+        let message = serde_json::ser::to_string(&TopicConfig {
+            name: format!("{}-{}", self.hostname, topic_name),
+            device_class: device_class.map(str::to_string),
+            state_topic: format!("system-mqtt/{}/{}", self.hostname, topic_name),
+            unit_of_measurement: unit_of_measurement.map(str::to_string),
+            icon: icon.map(str::to_string),
+        })
+        .context("Failed to serialize topic information.")?;
+        let mut publish = Publish::new(
+            format!(
+                "homeassistant/{}/system-mqtt-{}/{}/config",
+                topic_class, self.hostname, topic_name
+            ),
+            message.into(),
+        );
+        publish.set_retain(true);
+        self.client
+            .publish(&publish)
+            .await
+            .context("Failed to publish topic to MQTT server.")?;
+
+        Ok(())
+    }
+
+    pub async fn publish(&self, topic_name: &str, value: String) {
+        if self.registered_topics.contains(topic_name) {
+            let mut publish = Publish::new(
+                format!("system-mqtt/{}/{}", self.hostname, topic_name),
+                value.into(),
+            );
+            publish.set_retain(false);
+
+            if let Err(error) = self.client.publish(&publish).await {
+                log::error!("Failed to publish topic `{}`: {:?}", topic_name, error);
+            }
+        } else {
+            log::error!(
+                "Attempt to publish topic `{}`, which was never registered with Home Assistant.",
+                topic_name
+            );
+        }
+    }
+
+    pub async fn disconnect(mut self) -> Result<()> {
+        self.set_available(false).await?;
+        self.client.disconnect().await?;
+
+        Ok(())
+    }
 }
