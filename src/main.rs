@@ -230,6 +230,7 @@ async fn application_trampoline(config: &Config) -> Result<()> {
         .register_topic(
             "sensor",
             None,
+            Some(""),
             "available",
             None,
             Some("mdi:check-network-outline"),
@@ -240,6 +241,7 @@ async fn application_trampoline(config: &Config) -> Result<()> {
         .register_topic(
             "sensor",
             None,
+            Some(""),
             "uptime",
             Some("days"),
             Some("mdi:timer-sand"),
@@ -247,21 +249,43 @@ async fn application_trampoline(config: &Config) -> Result<()> {
         .await
         .context("Failed to register uptime topic.")?;
     home_assistant
-        .register_topic("sensor", None, "cpu", Some("%"), Some("mdi:gauge"))
+        .register_topic(
+            "sensor",
+            None,
+            Some("measurement"),
+            "cpu",
+            Some("%"),
+            Some("mdi:gauge"),
+        )
         .await
         .context("Failed to register CPU usage topic.")?;
     home_assistant
-        .register_topic("sensor", None, "memory", Some("%"), Some("mdi:gauge"))
+        .register_topic(
+            "sensor",
+            None,
+            Some("measurement"),
+            "memory",
+            Some("%"),
+            Some("mdi:gauge"),
+        )
         .await
         .context("Failed to register memory usage topic.")?;
     home_assistant
-        .register_topic("sensor", None, "swap", Some("%"), Some("mdi:gauge"))
+        .register_topic(
+            "sensor",
+            None,
+            Some("measurement"),
+            "swap",
+            Some("%"),
+            Some("mdi:gauge"),
+        )
         .await
         .context("Failed to register swap usage topic.")?;
     home_assistant
         .register_topic(
             "sensor",
             Some("battery"),
+            Some("measurement"),
             "battery_level",
             Some("%"),
             Some("mdi:battery"),
@@ -269,14 +293,28 @@ async fn application_trampoline(config: &Config) -> Result<()> {
         .await
         .context("Failed to register battery level topic.")?;
     home_assistant
-        .register_topic("sensor", None, "battery_state", None, Some("mdi:battery"))
+        .register_topic(
+            "sensor",
+            None,
+            Some(""),
+            "battery_state",
+            None,
+            Some("mdi:battery"),
+        )
         .await
         .context("Failed to register battery state topic.")?;
 
     // Register the sensors for filesystems
     for drive in &config.drives {
         home_assistant
-            .register_topic("sensor", None, &drive.name, Some("%"), Some("mdi:folder"))
+            .register_topic(
+                "sensor",
+                None,
+                Some("total"),
+                &drive.name,
+                Some("%"),
+                Some("mdi:folder"),
+            )
             .await
             .context("Failed to register a filesystem topic.")?;
     }
@@ -407,6 +445,7 @@ impl HomeAssistant {
         &mut self,
         topic_class: &str,
         device_class: Option<&str>,
+        state_class: Option<&str>,
         topic_name: &str,
         unit_of_measurement: Option<&str>,
         icon: Option<&str>,
@@ -419,6 +458,7 @@ impl HomeAssistant {
 
             #[serde(skip_serializing_if = "Option::is_none")]
             device_class: Option<String>,
+            state_class: Option<String>,
             state_topic: String,
             unit_of_measurement: Option<String>,
             icon: Option<String>,
@@ -427,6 +467,7 @@ impl HomeAssistant {
         let message = serde_json::ser::to_string(&TopicConfig {
             name: format!("{}-{}", self.hostname, topic_name),
             device_class: device_class.map(str::to_string),
+            state_class: state_class.map(str::to_string),
             state_topic: format!("system-mqtt/{}/{}", self.hostname, topic_name),
             unit_of_measurement: unit_of_measurement.map(str::to_string),
             icon: icon.map(str::to_string),
@@ -444,6 +485,8 @@ impl HomeAssistant {
             .publish(&publish)
             .await
             .context("Failed to publish topic to MQTT server.")?;
+
+        self.registered_topics.insert(topic_name.to_string());
 
         Ok(())
     }
