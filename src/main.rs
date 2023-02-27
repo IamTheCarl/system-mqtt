@@ -368,20 +368,24 @@ async fn availability_trampoline(
         .map(|drive_config| (drive_config.path.clone(), drive_config.name.clone()))
         .collect();
 
-    loop {
-        system.refresh_disks();
-        system.refresh_memory();
-        system.refresh_cpu();
+    system.refresh_disks();
+    system.refresh_memory();
+    system.refresh_cpu();
 
+    loop {
         tokio::select! {
             _ = time::sleep(config.update_interval) => {
+                system.refresh_disks();
+                system.refresh_memory();
+                system.refresh_cpu();
+
                 // Report uptime.
                 let uptime = system.uptime() as f32 / 60.0 / 60.0 / 24.0; // Convert from seconds to days.
                 home_assistant.publish("uptime", format!("{}", uptime)).await;
 
                 // Report CPU usage.
-                let cpu_usage = system.cpus().iter().map(|cpu| cpu.cpu_usage()).sum::<f32>() / system.cpus().len() as f32;
-                home_assistant.publish("cpu", (cpu_usage.clamp(0.0, 1.0) * 100.0).to_string()).await;
+                let cpu_usage = (system.cpus().iter().map(|cpu| cpu.cpu_usage()).sum::<f32>()) / (system.cpus().len() as f32 * 100.0);
+                home_assistant.publish("cpu", (cpu_usage * 100.0).to_string()).await;
 
                 // Report memory usage.
                 let memory_percentile = (system.total_memory() - system.available_memory()) as f64 / system.total_memory() as f64;
