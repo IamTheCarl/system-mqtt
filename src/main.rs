@@ -125,10 +125,12 @@ async fn load_config(path: &Path) -> Result<Config> {
     if path.is_file() {
         // It's a readable file we can load.
 
-        let config: Config = serde_yaml::from_str(&fs::read_to_string(path).await?)?;
+        let config: Config = serde_yaml::from_str(&fs::read_to_string(path).await?)
+            .context("Failed to deserialize config file.")?;
 
         Ok(config)
     } else {
+        log::info!("No config file present. A default one will be written.");
         // Doesn't exist yet. We'll create it.
         let config = Config::default();
 
@@ -154,6 +156,8 @@ async fn set_password(config: Config) -> Result<()> {
 }
 
 async fn application_trampoline(config: &Config) -> Result<()> {
+    log::info!("Application start.");
+
     let mut client_builder = Client::builder();
     client_builder.set_url_string(config.mqtt_server.as_str())?;
 
@@ -163,12 +167,14 @@ async fn application_trampoline(config: &Config) -> Result<()> {
 
         let password = match &config.password_source {
             PasswordSource::Keyring => {
+                log::info!("Using system keyring for MQTT password source.");
                 let keyring = keyring::Keyring::new(KEYRING_SERVICE_NAME, username);
                 keyring
                     .get_password()
                     .context("Failed to get password from keyring. If you have not yet set the password, run `system-mqtt set-password`.")?
             }
             PasswordSource::SecretFile(file_path) => {
+                log::info!("Using hidden file for MQTT password source.");
                 let metadata = file_path
                     .metadata()
                     .context("Failed to get password file metadata.")?;
@@ -198,67 +204,15 @@ async fn application_trampoline(config: &Config) -> Result<()> {
     }
 
     let mut client = client_builder.build()?;
-    client.connect().await?;
+    client
+        .connect()
+        .await
+        .context("Failed to connect to MQTT server.")?;
 
-    let manager = battery::Manager::new()?;
+    let manager = battery::Manager::new().context("Failed to initalize battery monitoring.")?;
 
-    let platform = host::platform().await?;
-    let hostname = platform.hostname();
-
-    async fn register_topic(
-        client: &mut Client,
-        hostname: &str,
-        topic_class: &str,
-        device_class: Option<&str>,
-        topic_name: &str,
-        unit_of_measurement: Option<&str>,
-        icon: Option<&str>,
-    ) -> Result<()> {
-        #[derive(Serialize)]
-        struct TopicConfig {
-            name: String,
-
-            #[serde(skip_serializing_if = "Option::is_none")]
-            device_class: Option<String>,
-            state_topic: String,
-            unit_of_measurement: Option<String>,
-            icon: Option<String>,
-        }
-
-        let message = serde_json::ser::to_string(&TopicConfig {
-            name: format!("{}-{}", hostname, topic_name),
-            device_class: device_class.map(str::to_string),
-            state_topic: format!("system-mqtt/{}/{}", hostname, topic_name),
-            unit_of_measurement: unit_of_measurement.map(str::to_string),
-            icon: icon.map(str::to_string),
-        })?;
-        let mut publish = Publish::new(
-            format!(
-                "homeassistant/{}/system-mqtt-{}/{}/config",
-                topic_class, hostname, topic_name
-            ),
-            message.into(),
-        );
-        publish.set_retain(true);
-        client.publish(&publish).await?;
-        Ok(())
-    }
-
-    async fn publish(
-        client: &mut Client,
-        hostname: &str,
-        topic_name: &str,
-        value: String,
-    ) -> Result<()> {
-        let mut publish = Publish::new(
-            format!("system-mqtt/{}/{}", hostname, topic_name),
-            value.into(),
-        );
-        publish.set_retain(false);
-        client.publish(&publish).await?;
-
-        Ok(())
-    }
+    let platform = host::platform().await.context("Failed to setup HEIM.")?;
+    let hostname = platform.hostname().to_string();
 
     // Register the various sensor topics and include the details about that sensor
 
@@ -267,87 +221,95 @@ async fn application_trampoline(config: &Config) -> Result<()> {
 
     register_topic(
         &mut client,
-        hostname,
+        &hostname,
         "sensor",
         None,
         "available",
         None,
         Some("mdi:check-network-outline"),
     )
-    .await?;
+    .await
+    .context("Failed to register availability topic.")?;
     register_topic(
         &mut client,
-        hostname,
+        &hostname,
         "sensor",
         None,
         "uptime",
         Some("days"),
         Some("mdi:timer-sand"),
     )
-    .await?;
+    .await
+    .context("Failed to register uptime topic.")?;
     register_topic(
         &mut client,
-        hostname,
+        &hostname,
         "sensor",
         None,
         "cpu",
         Some("%"),
         Some("mdi:gauge"),
     )
-    .await?;
+    .await
+    .context("Failed to register CPU usage topic.")?;
     register_topic(
         &mut client,
-        hostname,
+        &hostname,
         "sensor",
         None,
         "memory",
         Some("%"),
         Some("mdi:gauge"),
     )
-    .await?;
+    .await
+    .context("Failed to register memory usage topic.")?;
     register_topic(
         &mut client,
-        hostname,
+        &hostname,
         "sensor",
         None,
         "swap",
         Some("%"),
         Some("mdi:gauge"),
     )
-    .await?;
+    .await
+    .context("Failed to register swap usage topic.")?;
     register_topic(
         &mut client,
-        hostname,
+        &hostname,
         "sensor",
         Some("battery"),
         "battery_level",
         Some("%"),
         Some("mdi:battery"),
     )
-    .await?;
+    .await
+    .context("Failed to register battery level topic.")?;
     register_topic(
         &mut client,
-        hostname,
+        &hostname,
         "sensor",
         None,
         "battery_state",
         None,
         Some("mdi:battery"),
     )
-    .await?;
+    .await
+    .context("Failed to register battery state topic.")?;
 
     // Register the sensors for filesystems
     for drive in &config.drives {
         register_topic(
             &mut client,
-            hostname,
+            &hostname,
             "sensor",
             None,
             &drive.name,
             Some("%"),
             Some("mdi:folder"),
         )
-        .await?;
+        .await
+        .context("Failed to register a filesystem topic.")?;
     }
 
     client
@@ -358,21 +320,54 @@ async fn application_trampoline(config: &Config) -> Result<()> {
             )
             .set_retain(true),
         )
-        .await?;
+        .await
+        .context("Failed to publish availability topic.")?;
 
+    let result = availability_trampoline(&mut client, config, &hostname, manager).await;
+
+    if let Err(error) = client
+        .publish(
+            Publish::new(
+                format!("system-mqtt/{}/availability", hostname),
+                "offline".into(),
+            )
+            .set_retain(true),
+        )
+        .await
+    {
+        // I don't want this error hiding whatever happened in the main loop.
+        if result.is_ok() {
+            Err(error).context("Failed to publish change to offline state.")?
+        }
+    } else {
+        result?;
+    }
+
+    client.disconnect().await?;
+
+    Ok(())
+}
+
+async fn availability_trampoline(
+    client: &mut Client,
+    config: &Config,
+    hostname: &str,
+    manager: battery::Manager,
+) -> Result<()> {
     let cpu_stats = cpu::time().await?;
     let mut previous_used_cpu_time = cpu_stats.user() + cpu_stats.system();
     let mut previous_total_cpu_time = previous_used_cpu_time + cpu_stats.idle();
 
+    // FIXME A failure of any one of these shouldn't take down the application.
     loop {
         tokio::select! {
             _ = time::sleep(config.update_interval) => {
                 // Report uptime.
-                let uptime = host::uptime().await?;
-                publish(&mut client, hostname, "uptime", uptime.get::<heim::units::time::day>().to_string()).await?;
+                let uptime = host::uptime().await.context("Failed to get uptime.")?;
+                publish(client, hostname, "uptime", uptime.get::<heim::units::time::day>().to_string()).await?;
 
                 // Report CPU usage.
-                let cpu_stats = cpu::time().await?;
+                let cpu_stats = cpu::time().await.context("Failed to get CPU usage.")?;
                 let used_cpu_time = cpu_stats.user() + cpu_stats.system();
                 let total_cpu_time = used_cpu_time + cpu_stats.idle();
 
@@ -383,17 +378,17 @@ async fn application_trampoline(config: &Config) -> Result<()> {
                 previous_total_cpu_time = total_cpu_time;
 
                 let cpu_load_percentile = used_cpu_time_delta / total_cpu_time_delta;
-                publish(&mut client, hostname, "cpu", (cpu_load_percentile.get::<heim::units::ratio::ratio>().clamp(0.0, 1.0) * 100.0).to_string()).await?;
+                publish(client, hostname, "cpu", (cpu_load_percentile.get::<heim::units::ratio::ratio>().clamp(0.0, 1.0) * 100.0).to_string()).await?;
 
                 // Report memory usage.
-                let memory = memory::memory().await?;
+                let memory = memory::memory().await.context("Failed to get memory usage.")?;
                 let memory_percentile = (memory.total().get::<heim::units::information::byte>() - memory.available().get::<heim::units::information::byte>()) as f64 / memory.total().get::<heim::units::information::byte>() as f64;
-                publish(&mut client, hostname, "memory", (memory_percentile.clamp(0.0, 1.0)* 100.0).to_string()).await?;
+                publish(client, hostname, "memory", (memory_percentile.clamp(0.0, 1.0)* 100.0).to_string()).await?;
 
                 // Report swap usage.
-                let swap = memory::swap().await?;
+                let swap = memory::swap().await.context("Failed to get swap usage.")?;
                 let swap_percentile = swap.used().get::<heim::units::information::byte>() as f64 / swap.total().get::<heim::units::information::byte>() as f64;
-                publish(&mut client, hostname, "swap", (swap_percentile.clamp(0.0, 1.0) * 100.0).to_string()).await?;
+                publish(client, hostname, "swap", (swap_percentile.clamp(0.0, 1.0) * 100.0).to_string()).await?;
 
                 // Report filesystem usage.
                 for drive in &config.drives {
@@ -401,7 +396,7 @@ async fn application_trampoline(config: &Config) -> Result<()> {
                         Ok(disk) => {
                             let drive_percentile = (disk.total().get::<heim::units::information::byte>() - disk.free().get::<heim::units::information::byte>()) as f64 / disk.total().get::<heim::units::information::byte>() as f64;
 
-                            publish(&mut client, hostname, &drive.name, (drive_percentile.clamp(0.0, 1.0) * 100.0).to_string()).await?;
+                            publish(client, hostname, &drive.name, (drive_percentile.clamp(0.0, 1.0) * 100.0).to_string()).await?;
                         },
                         Err(error) => {
                             log::warn!("Unable to read drive usage statistics: {}", error);
@@ -421,13 +416,13 @@ async fn application_trampoline(config: &Config) -> Result<()> {
                         _ => "unknown",
                     };
 
-                    publish(&mut client, hostname, "battery_state", battery_state.to_string()).await?;
+                    publish(client, hostname, "battery_state", battery_state.to_string()).await?;
 
                     let battery_full = battery.energy_full();
                     let battery_power = battery.energy();
                     let battery_level = battery_power / battery_full;
 
-                    publish(&mut client, hostname, "battery_level", format!("{:03}", battery_level.get::<heim::units::ratio::percent>())).await?;
+                    publish(client, hostname, "battery_level", format!("{:03}", battery_level.get::<heim::units::ratio::percent>())).await?;
                 }
             }
             _ = signal::ctrl_c() => {
@@ -437,17 +432,67 @@ async fn application_trampoline(config: &Config) -> Result<()> {
         }
     }
 
-    client
-        .publish(
-            Publish::new(
-                format!("system-mqtt/{}/availability", hostname),
-                "offline".into(),
-            )
-            .set_retain(true),
-        )
-        .await?;
+    Ok(())
+}
 
-    client.disconnect().await?;
+async fn register_topic(
+    client: &mut Client,
+    hostname: &str,
+    topic_class: &str,
+    device_class: Option<&str>,
+    topic_name: &str,
+    unit_of_measurement: Option<&str>,
+    icon: Option<&str>,
+) -> Result<()> {
+    log::info!("Registering topic `{}`.", topic_name);
+
+    #[derive(Serialize)]
+    struct TopicConfig {
+        name: String,
+
+        #[serde(skip_serializing_if = "Option::is_none")]
+        device_class: Option<String>,
+        state_topic: String,
+        unit_of_measurement: Option<String>,
+        icon: Option<String>,
+    }
+
+    let message = serde_json::ser::to_string(&TopicConfig {
+        name: format!("{}-{}", hostname, topic_name),
+        device_class: device_class.map(str::to_string),
+        state_topic: format!("system-mqtt/{}/{}", hostname, topic_name),
+        unit_of_measurement: unit_of_measurement.map(str::to_string),
+        icon: icon.map(str::to_string),
+    })
+    .context("Failed to serialize topic information.")?;
+    let mut publish = Publish::new(
+        format!(
+            "homeassistant/{}/system-mqtt-{}/{}/config",
+            topic_class, hostname, topic_name
+        ),
+        message.into(),
+    );
+    publish.set_retain(true);
+    client
+        .publish(&publish)
+        .await
+        .context("Failed to publish topic to MQTT server.")?;
+
+    Ok(())
+}
+
+async fn publish(
+    client: &mut Client,
+    hostname: &str,
+    topic_name: &str,
+    value: String,
+) -> Result<()> {
+    let mut publish = Publish::new(
+        format!("system-mqtt/{}/{}", hostname, topic_name),
+        value.into(),
+    );
+    publish.set_retain(false);
+    client.publish(&publish).await?;
 
     Ok(())
 }
