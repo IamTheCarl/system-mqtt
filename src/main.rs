@@ -1,14 +1,14 @@
 use anyhow::{bail, Context, Result};
 use argh::FromArgs;
-use heim::{cpu, disk, host, memory};
 use mqtt_async_client::client::{Client as MqttClient, Publish};
 use serde::{Deserialize, Serialize};
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     os::unix::prelude::MetadataExt,
     path::{Path, PathBuf},
     time::Duration,
 };
+use sysinfo::{CpuExt, DiskExt, System, SystemExt};
 use tokio::{fs, signal, time};
 use url::Url;
 
@@ -212,8 +212,11 @@ async fn application_trampoline(config: &Config) -> Result<()> {
 
     let manager = battery::Manager::new().context("Failed to initalize battery monitoring.")?;
 
-    let platform = host::platform().await.context("Failed to setup HEIM.")?;
-    let hostname = platform.hostname().to_string();
+    let mut system = System::new_all();
+
+    let hostname = system
+        .host_name()
+        .context("Could not get system hostname.")?;
 
     let mut home_assistant = HomeAssistant {
         client,
@@ -321,7 +324,7 @@ async fn application_trampoline(config: &Config) -> Result<()> {
 
     home_assistant.set_available(true).await?;
 
-    let result = availability_trampoline(&home_assistant, config, manager).await;
+    let result = availability_trampoline(&home_assistant, &mut system, config, manager).await;
 
     if let Err(error) = home_assistant.set_available(false).await {
         // I don't want this error hiding whatever happened in the main loop.
@@ -337,56 +340,45 @@ async fn application_trampoline(config: &Config) -> Result<()> {
 
 async fn availability_trampoline(
     home_assistant: &HomeAssistant,
+    system: &mut System,
     config: &Config,
     manager: battery::Manager,
 ) -> Result<()> {
-    let cpu_stats = cpu::time().await?;
-    let mut previous_used_cpu_time = cpu_stats.user() + cpu_stats.system();
-    let mut previous_total_cpu_time = previous_used_cpu_time + cpu_stats.idle();
+    let drive_list: HashMap<PathBuf, String> = config
+        .drives
+        .iter()
+        .map(|drive_config| (drive_config.path.clone(), drive_config.name.clone()))
+        .collect();
 
-    // FIXME A failure of any one of these shouldn't take down the application.
     loop {
+        system.refresh_disks();
+        system.refresh_memory();
+        system.refresh_cpu();
+
         tokio::select! {
             _ = time::sleep(config.update_interval) => {
                 // Report uptime.
-                let uptime = host::uptime().await.context("Failed to get uptime.")?;
-                home_assistant.publish("uptime", uptime.get::<heim::units::time::day>().to_string()).await;
+                let uptime = system.uptime() as f32 / 60.0 / 60.0 / 24.0; // Convert from seconds to days.
+                home_assistant.publish("uptime", format!("{}", uptime)).await;
 
                 // Report CPU usage.
-                let cpu_stats = cpu::time().await.context("Failed to get CPU usage.")?;
-                let used_cpu_time = cpu_stats.user() + cpu_stats.system();
-                let total_cpu_time = used_cpu_time + cpu_stats.idle();
-
-                let used_cpu_time_delta = used_cpu_time - previous_used_cpu_time;
-                let total_cpu_time_delta = total_cpu_time - previous_total_cpu_time;
-
-                previous_used_cpu_time = used_cpu_time;
-                previous_total_cpu_time = total_cpu_time;
-
-                let cpu_load_percentile = used_cpu_time_delta / total_cpu_time_delta;
-                home_assistant.publish("cpu", (cpu_load_percentile.get::<heim::units::ratio::ratio>().clamp(0.0, 1.0) * 100.0).to_string()).await;
+                let cpu_usage = system.cpus().iter().map(|cpu| cpu.cpu_usage()).sum::<f32>() / system.cpus().len() as f32;
+                home_assistant.publish("cpu", (cpu_usage.clamp(0.0, 1.0) * 100.0).to_string()).await;
 
                 // Report memory usage.
-                let memory = memory::memory().await.context("Failed to get memory usage.")?;
-                let memory_percentile = (memory.total().get::<heim::units::information::byte>() - memory.available().get::<heim::units::information::byte>()) as f64 / memory.total().get::<heim::units::information::byte>() as f64;
+                let memory_percentile = (system.total_memory() - system.available_memory()) as f64 / system.total_memory() as f64;
                 home_assistant.publish("memory", (memory_percentile.clamp(0.0, 1.0)* 100.0).to_string()).await;
 
                 // Report swap usage.
-                let swap = memory::swap().await.context("Failed to get swap usage.")?;
-                let swap_percentile = swap.used().get::<heim::units::information::byte>() as f64 / swap.total().get::<heim::units::information::byte>() as f64;
+                let swap_percentile = system.used_swap() as f64 / system.free_swap() as f64;
                 home_assistant.publish("swap", (swap_percentile.clamp(0.0, 1.0) * 100.0).to_string()).await;
 
                 // Report filesystem usage.
-                for drive in &config.drives {
-                    match disk::usage(&drive.path).await {
-                        Ok(disk) => {
-                            let drive_percentile = (disk.total().get::<heim::units::information::byte>() - disk.free().get::<heim::units::information::byte>()) as f64 / disk.total().get::<heim::units::information::byte>() as f64;
+                for drive in system.disks() {
+                    if let Some(drive_name) = drive_list.get(drive.mount_point()) {
+                        let drive_percentile = (drive.total_space() - drive.available_space()) as f64 / drive.total_space() as f64;
 
-                            home_assistant.publish(&drive.name, (drive_percentile.clamp(0.0, 1.0) * 100.0).to_string()).await;
-                        },
-                        Err(error) => {
-                            log::warn!("Unable to read drive usage statistics: {}", error);
-                        }
+                        home_assistant.publish(drive_name, (drive_percentile.clamp(0.0, 1.0) * 100.0).to_string()).await;
                     }
                 }
 
@@ -408,7 +400,7 @@ async fn availability_trampoline(
                     let battery_power = battery.energy();
                     let battery_level = battery_power / battery_full;
 
-                    home_assistant.publish("battery_level", format!("{:03}", battery_level.get::<heim::units::ratio::percent>())).await;
+                    home_assistant.publish("battery_level", format!("{:03}", battery_level.value)).await;
                 }
             }
             _ = signal::ctrl_c() => {
@@ -492,6 +484,8 @@ impl HomeAssistant {
     }
 
     pub async fn publish(&self, topic_name: &str, value: String) {
+        log::debug!("PUBLISH `{}` TO `{}`", value, topic_name);
+
         if self.registered_topics.contains(topic_name) {
             let mut publish = Publish::new(
                 format!("system-mqtt/{}/{}", self.hostname, topic_name),

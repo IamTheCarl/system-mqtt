@@ -11,13 +11,7 @@ repository = "https://github.com/IamTheCarl/system-mqtt"
 [dependencies]
 argh = "0.1"
 battery = "0.7"
-heim = { version = "0.1.0-rc.1", features = [
-    "cpu",
-    "disk",
-    "memory",
-    "net",
-    "host",
-] }
+sysinfo = "0.28.1"
 keyring = "0.10"
 log = "0.4"
 mowl = "2"
