@@ -14,7 +14,7 @@ battery = "0.7"
 sysinfo = "0.28.1"
 keyring = "2.0"
 log = "0.4"
-mowl = "2"
+systemd-journal-logger = "0.7"
 mqtt-async-client = "0.3"
 rpassword = "7.2"
 serde = { version = "1.0", features = ["derive"] }
@@ -24,6 +24,7 @@ anyhow = "1.0.69"
 tokio = { version = "1", features = ["full"] }
 url = { version = "2.2", features = ["serde"] }
 users = "0.11.0"
+simple_logger = "4.0.0"
 
 [package.metadata.deb]
 systemd-units = { unit-name = "system-mqtt", unit-scripts = "systemd", enable = true }

@@ -35,7 +35,11 @@ enum SubCommand {
 #[derive(FromArgs, PartialEq, Debug)]
 /// Run the daemon.
 #[argh(subcommand, name = "run")]
-struct RunArguments {}
+struct RunArguments {
+    /// log to stderr instead of systemd's journal.
+    #[argh(switch)]
+    log_to_stderr: bool,
+}
 
 #[derive(FromArgs, PartialEq, Debug)]
 /// Set the password used to log into the mqtt client.
@@ -103,8 +107,17 @@ async fn main() {
 
     match load_config(&arguments.config_file).await {
         Ok(config) => match arguments.command {
-            SubCommand::Run(_arguments) => {
-                mowl::init_with_level(log::LevelFilter::Info).expect("Failed to setup log.");
+            SubCommand::Run(arguments) => {
+                if arguments.log_to_stderr {
+                    simple_logger::SimpleLogger::new()
+                        .env()
+                        .init()
+                        .expect("Failed to setup log.");
+                } else {
+                    systemd_journal_logger::init().expect("Failed to setup log.");
+                }
+
+                log::set_max_level(log::LevelFilter::Info);
 
                 while let Err(error) = application_trampoline(&config).await {
                     log::error!("Fatal error: {}", error);
@@ -165,7 +178,7 @@ async fn application_trampoline(config: &Config) -> Result<()> {
 
     // If credentials are provided, use them.
     if let Some(username) = &config.username {
-        // TODO make TLS mandatory when using this.
+        // TODO make TLS mandatory when using a password.
 
         let password = match &config.password_source {
             PasswordSource::Keyring => {
