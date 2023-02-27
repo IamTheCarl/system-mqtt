@@ -54,7 +54,10 @@ struct DriveConfig {
 
 #[derive(Serialize, Deserialize)]
 enum PasswordSource {
+    #[serde(rename = "keyring")]
     Keyring,
+
+    #[serde(rename = "secret_file")]
     SecretFile(PathBuf),
 }
 
