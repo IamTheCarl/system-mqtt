@@ -196,6 +196,7 @@ async fn application_trampoline(config: &Config) -> Result<()> {
         hostname: &str,
         topic_class: &str,
         device_class: Option<&str>,
+        state_class: Option<&str>,
         topic_name: &str,
         unit_of_measurement: Option<&str>,
         icon: Option<&str>,
@@ -206,6 +207,7 @@ async fn application_trampoline(config: &Config) -> Result<()> {
 
             #[serde(skip_serializing_if = "Option::is_none")]
             device_class: Option<String>,
+            state_class: Option<String>,
             state_topic: String,
             unit_of_measurement: Option<String>,
             icon: Option<String>,
@@ -214,6 +216,7 @@ async fn application_trampoline(config: &Config) -> Result<()> {
         let message = serde_json::ser::to_string(&TopicConfig {
             name: format!("{}-{}", hostname, topic_name),
             device_class: device_class.map(str::to_string),
+            state_class: state_class.map(str::to_string),
             state_topic: format!("system-mqtt/{}/{}", hostname, topic_name),
             unit_of_measurement: unit_of_measurement.map(str::to_string),
             icon: icon.map(str::to_string),
@@ -256,8 +259,9 @@ async fn application_trampoline(config: &Config) -> Result<()> {
         hostname,
         "sensor",
         None,
+        Some(""),
         "available",
-        None,
+        Some(""),
         Some("mdi:check-network-outline"),
     )
     .await?;
@@ -266,6 +270,7 @@ async fn application_trampoline(config: &Config) -> Result<()> {
         hostname,
         "sensor",
         None,
+        Some(""),
         "uptime",
         Some("days"),
         Some("mdi:timer-sand"),
@@ -276,6 +281,7 @@ async fn application_trampoline(config: &Config) -> Result<()> {
         hostname,
         "sensor",
         None,
+        Some("measurement"),
         "cpu",
         Some("%"),
         Some("mdi:gauge"),
@@ -286,6 +292,7 @@ async fn application_trampoline(config: &Config) -> Result<()> {
         hostname,
         "sensor",
         None,
+        Some("measurement"),
         "memory",
         Some("%"),
         Some("mdi:gauge"),
@@ -296,6 +303,7 @@ async fn application_trampoline(config: &Config) -> Result<()> {
         hostname,
         "sensor",
         None,
+        Some("measurement"),
         "swap",
         Some("%"),
         Some("mdi:gauge"),
@@ -306,6 +314,7 @@ async fn application_trampoline(config: &Config) -> Result<()> {
         hostname,
         "sensor",
         Some("battery"),
+        Some("measurement"),
         "battery_level",
         Some("%"),
         Some("mdi:battery"),
@@ -316,8 +325,9 @@ async fn application_trampoline(config: &Config) -> Result<()> {
         hostname,
         "sensor",
         None,
+        Some(""),
         "battery_state",
-        None,
+        Some(""),
         Some("mdi:battery"),
     )
     .await?;
@@ -329,6 +339,7 @@ async fn application_trampoline(config: &Config) -> Result<()> {
             hostname,
             "sensor",
             None,
+            Some("total"),
             &drive.name,
             Some("%"),
             Some("mdi:folder"),
