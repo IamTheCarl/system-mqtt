@@ -144,10 +144,11 @@ async fn load_config(path: &Path) -> Result<Config> {
 
 async fn set_password(config: Config) -> Result<()> {
     if let Some(username) = config.username {
-        let password = rpassword::read_password_from_tty(Some("Password: "))
+        let password = rpassword::prompt_password("Password: ")
             .context("Failed to read password from TTY.")?;
 
-        let keyring = keyring::Keyring::new(KEYRING_SERVICE_NAME, &username);
+        let keyring = keyring::Entry::new(KEYRING_SERVICE_NAME, &username)
+            .context("Failed to find password entry in keyring.")?;
         keyring.set_password(&password).context("Keyring error.")?;
 
         Ok(())
@@ -169,7 +170,8 @@ async fn application_trampoline(config: &Config) -> Result<()> {
         let password = match &config.password_source {
             PasswordSource::Keyring => {
                 log::info!("Using system keyring for MQTT password source.");
-                let keyring = keyring::Keyring::new(KEYRING_SERVICE_NAME, username);
+                let keyring = keyring::Entry::new(KEYRING_SERVICE_NAME, username)
+                    .context("Failed to find password entry in keyring.")?;
                 keyring
                     .get_password()
                     .context("Failed to get password from keyring. If you have not yet set the password, run `system-mqtt set-password`.")?
