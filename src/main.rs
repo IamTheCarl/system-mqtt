@@ -1,12 +1,14 @@
+use anyhow::{bail, Context, Result};
 use argh::FromArgs;
-use heim::{cpu, disk, host, memory};
-use mqtt_async_client::client::{Client, Publish};
+use mqtt_async_client::client::{Client as MqttClient, Publish};
 use serde::{Deserialize, Serialize};
 use std::{
+    collections::{HashMap, HashSet},
+    os::unix::prelude::MetadataExt,
     path::{Path, PathBuf},
     time::Duration,
 };
-use thiserror::Error;
+use sysinfo::{CpuExt, DiskExt, System, SystemExt};
 use tokio::{fs, signal, time};
 use url::Url;
 
@@ -33,7 +35,11 @@ enum SubCommand {
 #[derive(FromArgs, PartialEq, Debug)]
 /// Run the daemon.
 #[argh(subcommand, name = "run")]
-struct RunArguments {}
+struct RunArguments {
+    /// log to stderr instead of systemd's journal.
+    #[argh(switch)]
+    log_to_stderr: bool,
+}
 
 #[derive(FromArgs, PartialEq, Debug)]
 /// Set the password used to log into the mqtt client.
@@ -47,6 +53,21 @@ struct DriveConfig {
 }
 
 #[derive(Serialize, Deserialize)]
+enum PasswordSource {
+    #[serde(rename = "keyring")]
+    Keyring,
+
+    #[serde(rename = "secret_file")]
+    SecretFile(PathBuf),
+}
+
+impl Default for PasswordSource {
+    fn default() -> Self {
+        Self::Keyring
+    }
+}
+
+#[derive(Serialize, Deserialize)]
 struct Config {
     /// The URL of the mqtt server.
     mqtt_server: Url,
@@ -54,6 +75,12 @@ struct Config {
     /// Set the username to connect to the mqtt server, if required.
     /// The password will be fetched from the OS keyring.
     username: Option<String>,
+
+    /// Where the password for the MQTT server can be found.
+    /// If a username is not specified, this field is ignored.
+    /// If not specified, this field defaults to the keyring.
+    #[serde(default)]
+    password_source: PasswordSource,
 
     /// The interval to update at.
     update_interval: Duration,
@@ -67,6 +94,7 @@ impl Default for Config {
         Self {
             mqtt_server: Url::parse("mqtt://localhost").expect("Failed to parse default URL."),
             username: None,
+            password_source: PasswordSource::Keyring,
             update_interval: Duration::from_secs(30),
             drives: vec![DriveConfig {
                 path: PathBuf::from("/"),
@@ -76,53 +104,26 @@ impl Default for Config {
     }
 }
 
-#[derive(Error, Debug)]
-enum Error {
-    #[error("IO Error: {0}")]
-    Io(#[from] std::io::Error),
-
-    #[error("Yaml encoding error: {0}")]
-    YamlEncoding(#[from] serde_yaml::Error),
-
-    #[error("Json encoding error: {0}")]
-    JsonEncoding(#[from] serde_json::Error),
-
-    #[error("You must set the username for login with the mqtt server before you can set the user's password")]
-    CredentialsNotEnabled,
-
-    #[error(
-        "Keyring Error: {0}\nIf you have not yet set the password run `system-mqtt set-password`."
-    )]
-    Keyring(#[from] keyring::KeyringError),
-
-    #[error("Error with mqtt protocol: {0}")]
-    Mqtt(#[from] mqtt_async_client::Error),
-
-    #[error("Failed to fetch system info: {0}")]
-    SystemInfo(#[from] heim::Error),
-
-    #[error("Failed to read battery info: {0}")]
-    Battery(#[from] battery::Error),
-}
-
-type Result<T> = std::result::Result<T, Error>;
-
 #[tokio::main]
 async fn main() {
     let arguments: Arguments = argh::from_env();
 
     match load_config(&arguments.config_file).await {
         Ok(config) => match arguments.command {
-            SubCommand::Run(_arguments) => {
-                mowl::init_with_level(log::LevelFilter::Info).expect("Failed to setup log.");
+            SubCommand::Run(arguments) => {
+                if arguments.log_to_stderr {
+                    simple_logger::SimpleLogger::new()
+                        .env()
+                        .init()
+                        .expect("Failed to setup log.");
+                } else {
+                    systemd_journal_logger::init().expect("Failed to setup log.");
+                }
 
-                loop {
-                    if let Err(error) = application_trampoline(&config).await {
-                        log::error!("Fatal error: {}", error);
-                    } else {
-                        // This is a graceful shutdown.
-                        break;
-                    }
+                log::set_max_level(log::LevelFilter::Info);
+
+                while let Err(error) = application_trampoline(&config).await {
+                    log::error!("Fatal error: {}", error);
                 }
             }
             SubCommand::SetPassword(_arguments) => {
@@ -141,10 +142,12 @@ async fn load_config(path: &Path) -> Result<Config> {
     if path.is_file() {
         // It's a readable file we can load.
 
-        let config: Config = serde_yaml::from_str(&fs::read_to_string(path).await?)?;
+        let config: Config = serde_yaml::from_str(&fs::read_to_string(path).await?)
+            .context("Failed to deserialize config file.")?;
 
         Ok(config)
     } else {
+        log::info!("No config file present. A default one will be written.");
         // Doesn't exist yet. We'll create it.
         let config = Config::default();
 
@@ -157,43 +160,303 @@ async fn load_config(path: &Path) -> Result<Config> {
 
 async fn set_password(config: Config) -> Result<()> {
     if let Some(username) = config.username {
-        let password = rpassword::read_password_from_tty(Some("Password: "))?;
+        let password = rpassword::prompt_password("Password: ")
+            .context("Failed to read password from TTY.")?;
 
-        let keyring = keyring::Keyring::new(KEYRING_SERVICE_NAME, &username);
-        keyring.set_password(&password)?;
+        let keyring = keyring::Entry::new(KEYRING_SERVICE_NAME, &username)
+            .context("Failed to find password entry in keyring.")?;
+        keyring.set_password(&password).context("Keyring error.")?;
 
         Ok(())
     } else {
-        Err(Error::CredentialsNotEnabled)
+        bail!("You must set the username for login with the mqtt server before you can set the user's password")
     }
 }
 
 async fn application_trampoline(config: &Config) -> Result<()> {
-    let mut client_builder = Client::builder();
+    log::info!("Application start.");
+
+    let mut client_builder = MqttClient::builder();
     client_builder.set_url_string(config.mqtt_server.as_str())?;
 
     // If credentials are provided, use them.
     if let Some(username) = &config.username {
-        // TODO make TLS mandatory when using this.
+        // TODO make TLS mandatory when using a password.
 
-        let keyring = keyring::Keyring::new(KEYRING_SERVICE_NAME, &username);
-        let password = keyring.get_password()?;
+        let password = match &config.password_source {
+            PasswordSource::Keyring => {
+                log::info!("Using system keyring for MQTT password source.");
+                let keyring = keyring::Entry::new(KEYRING_SERVICE_NAME, username)
+                    .context("Failed to find password entry in keyring.")?;
+                keyring
+                    .get_password()
+                    .context("Failed to get password from keyring. If you have not yet set the password, run `system-mqtt set-password`.")?
+            }
+            PasswordSource::SecretFile(file_path) => {
+                log::info!("Using hidden file for MQTT password source.");
+                let metadata = file_path
+                    .metadata()
+                    .context("Failed to get password file metadata.")?;
+
+                // It's not even an encrypted file, so we need to keep the permission settings pretty tight.
+                // The only time I can really enforce that is when reading the password.
+                if metadata.mode() == 0o600 {
+                    if metadata.uid() == users::get_current_uid() {
+                        if metadata.gid() == users::get_current_gid() {
+                            fs::read_to_string(file_path)
+                                .await
+                                .context("Failed to read password file.")?
+                        } else {
+                            bail!("Password file must be owned by the current group.");
+                        }
+                    } else {
+                        bail!("Password file must be owned by the current user.");
+                    }
+                } else {
+                    bail!("Permission bits for password file must be set to 0o600 (only owner can read and write)");
+                }
+            }
+        };
 
         client_builder.set_username(Some(username.into()));
         client_builder.set_password(Some(password.into()));
     }
 
     let mut client = client_builder.build()?;
-    client.connect().await?;
+    client
+        .connect()
+        .await
+        .context("Failed to connect to MQTT server.")?;
 
-    let manager = battery::Manager::new()?;
+    let manager = battery::Manager::new().context("Failed to initalize battery monitoring.")?;
 
-    let platform = host::platform().await?;
-    let hostname = platform.hostname();
+    let mut system = System::new_all();
 
-    async fn register_topic(
-        client: &mut Client,
-        hostname: &str,
+    let hostname = system
+        .host_name()
+        .context("Could not get system hostname.")?;
+
+    let mut home_assistant = HomeAssistant {
+        client,
+        hostname,
+        registered_topics: HashSet::new(),
+    };
+
+    // Register the various sensor topics and include the details about that sensor
+
+    //    TODO - create a new register_topic to register binary_sensor so we can make availability a real binary sensor. In the
+    //    meantime, create it as a normal analog sensor with two values, and a template can be used to make it a binary.
+
+    home_assistant
+        .register_topic(
+            "sensor",
+            None,
+            Some(""),
+            "available",
+            None,
+            Some("mdi:check-network-outline"),
+        )
+        .await
+        .context("Failed to register availability topic.")?;
+    home_assistant
+        .register_topic(
+            "sensor",
+            None,
+            Some(""),
+            "uptime",
+            Some("days"),
+            Some("mdi:timer-sand"),
+        )
+        .await
+        .context("Failed to register uptime topic.")?;
+    home_assistant
+        .register_topic(
+            "sensor",
+            None,
+            Some("measurement"),
+            "cpu",
+            Some("%"),
+            Some("mdi:gauge"),
+        )
+        .await
+        .context("Failed to register CPU usage topic.")?;
+    home_assistant
+        .register_topic(
+            "sensor",
+            None,
+            Some("measurement"),
+            "memory",
+            Some("%"),
+            Some("mdi:gauge"),
+        )
+        .await
+        .context("Failed to register memory usage topic.")?;
+    home_assistant
+        .register_topic(
+            "sensor",
+            None,
+            Some("measurement"),
+            "swap",
+            Some("%"),
+            Some("mdi:gauge"),
+        )
+        .await
+        .context("Failed to register swap usage topic.")?;
+    home_assistant
+        .register_topic(
+            "sensor",
+            Some("battery"),
+            Some("measurement"),
+            "battery_level",
+            Some("%"),
+            Some("mdi:battery"),
+        )
+        .await
+        .context("Failed to register battery level topic.")?;
+    home_assistant
+        .register_topic(
+            "sensor",
+            None,
+            Some(""),
+            "battery_state",
+            None,
+            Some("mdi:battery"),
+        )
+        .await
+        .context("Failed to register battery state topic.")?;
+
+    // Register the sensors for filesystems
+    for drive in &config.drives {
+        home_assistant
+            .register_topic(
+                "sensor",
+                None,
+                Some("total"),
+                &drive.name,
+                Some("%"),
+                Some("mdi:folder"),
+            )
+            .await
+            .context("Failed to register a filesystem topic.")?;
+    }
+
+    home_assistant.set_available(true).await?;
+
+    let result = availability_trampoline(&home_assistant, &mut system, config, manager).await;
+
+    if let Err(error) = home_assistant.set_available(false).await {
+        // I don't want this error hiding whatever happened in the main loop.
+        log::error!("Error while disconnecting from home assistant: {:?}", error);
+    }
+
+    result?;
+
+    home_assistant.disconnect().await?;
+
+    Ok(())
+}
+
+async fn availability_trampoline(
+    home_assistant: &HomeAssistant,
+    system: &mut System,
+    config: &Config,
+    manager: battery::Manager,
+) -> Result<()> {
+    let drive_list: HashMap<PathBuf, String> = config
+        .drives
+        .iter()
+        .map(|drive_config| (drive_config.path.clone(), drive_config.name.clone()))
+        .collect();
+
+    system.refresh_disks();
+    system.refresh_memory();
+    system.refresh_cpu();
+
+    loop {
+        tokio::select! {
+            _ = time::sleep(config.update_interval) => {
+                system.refresh_disks();
+                system.refresh_memory();
+                system.refresh_cpu();
+
+                // Report uptime.
+                let uptime = system.uptime() as f32 / 60.0 / 60.0 / 24.0; // Convert from seconds to days.
+                home_assistant.publish("uptime", format!("{}", uptime)).await;
+
+                // Report CPU usage.
+                let cpu_usage = (system.cpus().iter().map(|cpu| cpu.cpu_usage()).sum::<f32>()) / (system.cpus().len() as f32 * 100.0);
+                home_assistant.publish("cpu", (cpu_usage * 100.0).to_string()).await;
+
+                // Report memory usage.
+                let memory_percentile = (system.total_memory() - system.available_memory()) as f64 / system.total_memory() as f64;
+                home_assistant.publish("memory", (memory_percentile.clamp(0.0, 1.0)* 100.0).to_string()).await;
+
+                // Report swap usage.
+                let swap_percentile = system.used_swap() as f64 / system.free_swap() as f64;
+                home_assistant.publish("swap", (swap_percentile.clamp(0.0, 1.0) * 100.0).to_string()).await;
+
+                // Report filesystem usage.
+                for drive in system.disks() {
+                    if let Some(drive_name) = drive_list.get(drive.mount_point()) {
+                        let drive_percentile = (drive.total_space() - drive.available_space()) as f64 / drive.total_space() as f64;
+
+                        home_assistant.publish(drive_name, (drive_percentile.clamp(0.0, 1.0) * 100.0).to_string()).await;
+                    }
+                }
+
+                // TODO we should probably combine the battery charges, but for now we're just going to use the first detected battery.
+                if let Some(battery) = manager.batteries().context("Failed to read battery info.")?.flatten().next() {
+                    use battery::State;
+
+                    let battery_state = match battery.state() {
+                        State::Charging => "charging",
+                        State::Discharging => "discharging",
+                        State::Empty => "empty",
+                        State::Full => "full",
+                        _ => "unknown",
+                    };
+
+                    home_assistant.publish("battery_state", battery_state.to_string()).await;
+
+                    let battery_full = battery.energy_full();
+                    let battery_power = battery.energy();
+                    let battery_level = battery_power / battery_full;
+
+                    home_assistant.publish("battery_level", format!("{:03}", battery_level.value)).await;
+                }
+            }
+            _ = signal::ctrl_c() => {
+                log::info!("Terminate signal has been received.");
+                break;
+            }
+        }
+    }
+
+    Ok(())
+}
+
+pub struct HomeAssistant {
+    client: MqttClient,
+    hostname: String,
+    registered_topics: HashSet<String>,
+}
+
+impl HomeAssistant {
+    pub async fn set_available(&self, available: bool) -> Result<()> {
+        self.client
+            .publish(
+                Publish::new(
+                    format!("system-mqtt/{}/availability", self.hostname),
+                    if available { "online" } else { "offline" }.into(),
+                )
+                .set_retain(true),
+            )
+            .await
+            .context("Failed to publish availability topic.")
+    }
+
+    pub async fn register_topic(
+        &mut self,
         topic_class: &str,
         device_class: Option<&str>,
         state_class: Option<&str>,
@@ -201,6 +464,8 @@ async fn application_trampoline(config: &Config) -> Result<()> {
         unit_of_measurement: Option<&str>,
         icon: Option<&str>,
     ) -> Result<()> {
+        log::info!("Registering topic `{}`.", topic_name);
+
         #[derive(Serialize)]
         struct TopicConfig {
             name: String,
@@ -214,241 +479,57 @@ async fn application_trampoline(config: &Config) -> Result<()> {
         }
 
         let message = serde_json::ser::to_string(&TopicConfig {
-            name: format!("{}-{}", hostname, topic_name),
+            name: format!("{}-{}", self.hostname, topic_name),
             device_class: device_class.map(str::to_string),
             state_class: state_class.map(str::to_string),
-            state_topic: format!("system-mqtt/{}/{}", hostname, topic_name),
+            state_topic: format!("system-mqtt/{}/{}", self.hostname, topic_name),
             unit_of_measurement: unit_of_measurement.map(str::to_string),
             icon: icon.map(str::to_string),
-        })?;
+        })
+        .context("Failed to serialize topic information.")?;
         let mut publish = Publish::new(
             format!(
                 "homeassistant/{}/system-mqtt-{}/{}/config",
-                topic_class, hostname, topic_name
+                topic_class, self.hostname, topic_name
             ),
             message.into(),
         );
         publish.set_retain(true);
-        client.publish(&publish).await?;
-        Ok(())
-    }
+        self.client
+            .publish(&publish)
+            .await
+            .context("Failed to publish topic to MQTT server.")?;
 
-    async fn publish(
-        client: &mut Client,
-        hostname: &str,
-        topic_name: &str,
-        value: String,
-    ) -> Result<()> {
-        let mut publish = Publish::new(
-            format!("system-mqtt/{}/{}", hostname, topic_name),
-            value.into(),
-        );
-        publish.set_retain(false);
-        client.publish(&publish).await?;
+        self.registered_topics.insert(topic_name.to_string());
 
         Ok(())
     }
 
-    // Register the various sensor topics and include the details about that sensor
+    pub async fn publish(&self, topic_name: &str, value: String) {
+        log::debug!("PUBLISH `{}` TO `{}`", value, topic_name);
 
-    //    TODO - create a new register_topic to register binary_sensor so we can make availability a real binary sensor. In the
-    //    meantime, create it as a normal analog sensor with two values, and a template can be used to make it a binary.
+        if self.registered_topics.contains(topic_name) {
+            let mut publish = Publish::new(
+                format!("system-mqtt/{}/{}", self.hostname, topic_name),
+                value.into(),
+            );
+            publish.set_retain(false);
 
-    register_topic(
-        &mut client,
-        hostname,
-        "sensor",
-        None,
-        Some(""),
-        "available",
-        Some(""),
-        Some("mdi:check-network-outline"),
-    )
-    .await?;
-    register_topic(
-        &mut client,
-        hostname,
-        "sensor",
-        None,
-        Some(""),
-        "uptime",
-        Some("days"),
-        Some("mdi:timer-sand"),
-    )
-    .await?;
-    register_topic(
-        &mut client,
-        hostname,
-        "sensor",
-        None,
-        Some("measurement"),
-        "cpu",
-        Some("%"),
-        Some("mdi:gauge"),
-    )
-    .await?;
-    register_topic(
-        &mut client,
-        hostname,
-        "sensor",
-        None,
-        Some("measurement"),
-        "memory",
-        Some("%"),
-        Some("mdi:gauge"),
-    )
-    .await?;
-    register_topic(
-        &mut client,
-        hostname,
-        "sensor",
-        None,
-        Some("measurement"),
-        "swap",
-        Some("%"),
-        Some("mdi:gauge"),
-    )
-    .await?;
-    register_topic(
-        &mut client,
-        hostname,
-        "sensor",
-        Some("battery"),
-        Some("measurement"),
-        "battery_level",
-        Some("%"),
-        Some("mdi:battery"),
-    )
-    .await?;
-    register_topic(
-        &mut client,
-        hostname,
-        "sensor",
-        None,
-        Some(""),
-        "battery_state",
-        Some(""),
-        Some("mdi:battery"),
-    )
-    .await?;
-
-    // Register the sensors for filesystems
-    for drive in &config.drives {
-        register_topic(
-            &mut client,
-            hostname,
-            "sensor",
-            None,
-            Some("total"),
-            &drive.name,
-            Some("%"),
-            Some("mdi:folder"),
-        )
-        .await?;
-    }
-
-    client
-        .publish(
-            &Publish::new(
-                format!("system-mqtt/{}/availability", hostname),
-                "online".into(),
-            )
-            .set_retain(true),
-        )
-        .await?;
-
-    let cpu_stats = cpu::time().await?;
-    let mut previous_used_cpu_time = cpu_stats.user() + cpu_stats.system();
-    let mut previous_total_cpu_time = previous_used_cpu_time + cpu_stats.idle();
-
-    loop {
-        tokio::select! {
-            _ = time::sleep(config.update_interval) => {
-                // Report uptime.
-                let uptime = host::uptime().await?;
-                publish(&mut client, &hostname, "uptime", uptime.get::<heim::units::time::day>().to_string()).await?;
-
-                // Report CPU usage.
-                let cpu_stats = cpu::time().await?;
-                let used_cpu_time = cpu_stats.user() + cpu_stats.system();
-                let total_cpu_time = used_cpu_time + cpu_stats.idle();
-
-                let used_cpu_time_delta = used_cpu_time - previous_used_cpu_time;
-                let total_cpu_time_delta = total_cpu_time - previous_total_cpu_time;
-
-                previous_used_cpu_time = used_cpu_time;
-                previous_total_cpu_time = total_cpu_time;
-
-                let cpu_load_percentile = used_cpu_time_delta / total_cpu_time_delta;
-                publish(&mut client, &hostname, "cpu", (cpu_load_percentile.get::<heim::units::ratio::ratio>().clamp(0.0, 1.0) * 100.0).to_string()).await?;
-
-                // Report memory usage.
-                let memory = memory::memory().await?;
-                let memory_percentile = (memory.total().get::<heim::units::information::byte>() - memory.available().get::<heim::units::information::byte>()) as f64 / memory.total().get::<heim::units::information::byte>() as f64;
-                publish(&mut client, &hostname, "memory", (memory_percentile.clamp(0.0, 1.0)* 100.0).to_string()).await?;
-
-                // Report swap usage.
-                let swap = memory::swap().await?;
-                let swap_percentile = swap.used().get::<heim::units::information::byte>() as f64 / swap.total().get::<heim::units::information::byte>() as f64;
-                publish(&mut client, &hostname, "swap", (swap_percentile.clamp(0.0, 1.0) * 100.0).to_string()).await?;
-
-                // Report filesystem usage.
-                for drive in &config.drives {
-                    match disk::usage(&drive.path).await {
-                        Ok(disk) => {
-                            let drive_percentile = (disk.total().get::<heim::units::information::byte>() - disk.free().get::<heim::units::information::byte>()) as f64 / disk.total().get::<heim::units::information::byte>() as f64;
-
-                            publish(&mut client, &hostname, &drive.name, (drive_percentile.clamp(0.0, 1.0) * 100.0).to_string()).await?;
-                        },
-                        Err(error) => {
-                            log::warn!("Unable to read drive usage statistics: {}", error);
-                        }
-                    }
-                }
-
-                for maybe_battery in manager.batteries()? {
-                    if let Ok(battery) = maybe_battery {
-                        use battery::State;
-
-                        let battery_state = match battery.state() {
-                            State::Charging => "charging",
-                            State::Discharging => "discharging",
-                            State::Empty => "empty",
-                            State::Full => "full",
-                            _ => "unknown",
-                        };
-
-                        publish(&mut client, &hostname, "battery_state", battery_state.to_string()).await?;
-
-                        let battery_full = battery.energy_full();
-                        let battery_power = battery.energy();
-                        let battery_level = battery_power / battery_full;
-
-                        publish(&mut client, &hostname, "battery_level", format!("{:03}", battery_level.get::<heim::units::ratio::percent>())).await?;
-
-                        // TODO we should probably combine the battery charges, but for now we're just going to use the first detected battery.
-                        break;
-                    }
-                }
+            if let Err(error) = self.client.publish(&publish).await {
+                log::error!("Failed to publish topic `{}`: {:?}", topic_name, error);
             }
-            _ = signal::ctrl_c() => {
-                log::info!("Terminate signal has been received.");
-                break;
-            }
+        } else {
+            log::error!(
+                "Attempt to publish topic `{}`, which was never registered with Home Assistant.",
+                topic_name
+            );
         }
     }
 
-    client
-        .publish(
-            &Publish::new(
-                format!("system-mqtt/{}/availability", hostname),
-                "offline".into(),
-            )
-            .set_retain(true),
-        )
-        .await?;
+    pub async fn disconnect(mut self) -> Result<()> {
+        self.set_available(false).await?;
+        self.client.disconnect().await?;
 
-    client.disconnect().await?;
-
-    Ok(())
+        Ok(())
+    }
 }

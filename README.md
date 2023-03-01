@@ -68,6 +68,14 @@ mqtt_server: "mqtt://localhost"
 # prompt will ask you for the login password.
 username: ~
 
+# If unspecified, this will default to `keyring`, where it uses the system keyring for your password.
+password_source: keyring
+
+# Alternatively, you can use a "secret file" for your password. It's an unencrypted plaintext file with the password. You must set the file to be owned by the user running system-mqtt (typically root) and set the permissions so that only the user can access the file.
+# This is derived from the security policies used by ssh and OpenPGP. It's a little less ideal than keyring so you should prefer keyring if you can use it.
+# Here's an example of how you'd point to where that file is located:
+# password_source: !secret_file /path/to/file
+
 # The amount of time to wait between each report of the system statistics.
 update_interval:
   secs: 30
