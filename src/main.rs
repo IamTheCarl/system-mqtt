@@ -200,12 +200,13 @@ async fn application_trampoline(config: &Config) -> Result<()> {
 
                 // It's not even an encrypted file, so we need to keep the permission settings pretty tight.
                 // The only time I can really enforce that is when reading the password.
-                if metadata.mode() == 0o600 {
+                if metadata.mode() & 0o777 == 0o600 {
                     if metadata.uid() == users::get_current_uid() {
                         if metadata.gid() == users::get_current_gid() {
-                            fs::read_to_string(file_path)
+                            let pass: String = fs::read_to_string(file_path)
                                 .await
-                                .context("Failed to read password file.")?
+                                .context("Failed to read password file.")?;
+                            pass.as_str().trim_end().to_string()
                         } else {
                             bail!("Password file must be owned by the current group.");
                         }
@@ -219,7 +220,7 @@ async fn application_trampoline(config: &Config) -> Result<()> {
         };
 
         client_builder.set_username(Some(username.into()));
-        client_builder.set_password(Some(password.into()));
+        client_builder.set_password(Some(password.as_bytes().to_vec()));
     }
 
     let mut client = client_builder.build()?;
